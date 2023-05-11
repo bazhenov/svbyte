@@ -121,18 +121,14 @@ impl Decoder<u32, 4> for StreamVByteDecoder {
         if size == 0 {
             return 0;
         }
-        let mut control_word = control_word[0];
-        for (i, item) in buffer.iter_mut().enumerate() {
-            // Using rotate (not shift!) to read most significant bit pairs first
-            control_word = control_word.rotate_left(2);
-            let length = (control_word & 0b11) + 1;
+        let lengts = byte_to_4_length(control_word[0]);
+        for (i, (item, len)) in buffer.iter_mut().zip(lengts.iter()).enumerate() {
             let mut be_bytes = [0u8; 4];
 
-            // Reading exactly length bytes from data stream into corresponding
-            // byte positions of a number
+            // Reading exactly length bytes from data stream into corresponding byte positions of a number
             let result = self
                 .data_stream
-                .read_exact(&mut be_bytes[4 - length as usize..]);
+                .read_exact(&mut be_bytes[4 - *len as usize..]);
             match result {
                 Ok(_) => *item = u32::from_be_bytes(be_bytes),
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return i,
@@ -143,18 +139,29 @@ impl Decoder<u32, 4> for StreamVByteDecoder {
     }
 }
 
+/// Decoding control byte to 4 corresponding length
+///
+/// The length of each integer es encoded as 2 bits: from 00 (length 1) to 11 (length 4).
+fn byte_to_4_length(input: u8) -> [u8; 4] {
+    [
+        (input.rotate_left(2) & 0b11) + 1,
+        (input.rotate_left(4) & 0b11) + 1,
+        (input.rotate_left(6) & 0b11) + 1,
+        (input.rotate_left(8) & 0b11) + 1,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn check_encode() {
         let (control, data) = encode_values(&[0x01, 0x0100, 0x010000, 0x01000000, 0x010000]);
 
         assert_eq!(
-            data.into_inner(),
+            data,
             [
                 0x01, //
                 0x01, 0x00, //
@@ -164,7 +171,6 @@ mod tests {
             ]
         );
 
-        let control = control.into_inner();
         let len = byte_to_4_length(control[0]);
         assert_eq!(len, [1, 2, 3, 4]);
 
@@ -176,7 +182,7 @@ mod tests {
     fn check_decode() {
         let input = [1, 255, 1024, 2048, 0xFF000000];
         let (control, data) = encode_values(&input);
-        let mut decoder = StreamVByteDecoder::new(control.into_inner(), data.into_inner());
+        let mut decoder = StreamVByteDecoder::new(control, data);
         let mut buffer = [0u32; 4];
 
         for chunk in input.chunks(4) {
@@ -187,22 +193,10 @@ mod tests {
         }
     }
 
-    fn encode_values(input: &[u32]) -> (Cursor<Vec<u8>>, Cursor<Vec<u8>>) {
+    fn encode_values(input: &[u32]) -> (Vec<u8>, Vec<u8>) {
         let mut encoder = StreamVByteEncoder::new(Cursor::new(vec![]), Cursor::new(vec![]));
         encoder.encode(&input).unwrap();
         let (control, data) = encoder.finish().unwrap();
-        (control, data)
-    }
-
-    /// Decoding control byte to 4 corresponding length
-    ///
-    /// The length of each integer es encoded as 2 bits: from 00 (length 1) to 11 (length 4).
-    fn byte_to_4_length(input: u8) -> [u8; 4] {
-        [
-            (input.rotate_left(2) & 0b11) + 1,
-            (input.rotate_left(4) & 0b11) + 1,
-            (input.rotate_left(6) & 0b11) + 1,
-            (input.rotate_left(8) & 0b11) + 1,
-        ]
+        (control.into_inner(), data.into_inner())
     }
 }
