@@ -1,16 +1,23 @@
-//! This library provides encoding/decoding primitives for Stream VByte encoding.
-//!
-//! Stream VByte encoding is a SIMD accelerated algorithm of varint decompression. It is used
-//! in a search and database systems as a way of efficiently store and stream large number of varints
-//! from a disk or main memory.
-//!
-//! The idea behind varint is not to store leading bytes of a number, so large amount of relatively small
-//! numbers can be stored in a much more compact way. Varint encoding is frequently used with delta-encoding if numbers
-//! are stored in the ascending order. This way all the numbers are smaller by magnitude, hence better compression.
-//!
-//! Original publication: [Decoding billions of integers per second through vectorization](https://arxiv.org/abs/1209.2137)
-//! by Daniel Lemire and Leonid Boytsov. Blog post by Daniel Lemire:
-//! [Stream VByte: breaking new speed records for integer compression](https://lemire.me/blog/2017/09/27/stream-vbyte-breaking-new-speed-records-for-integer-compression/)
+/*!
+This library provides encoding/decoding primitives for Stream VByte encoding.
+
+Stream VByte encoding is a SIMD accelerated algorithm of VarInt decompression. It is used in a search and database
+systems as a way of efficiently store and stream large number of VarInts from a disk or main memory.
+
+The idea behind VarInt is not to store leading bytes of a number, so large amount of relatively small numbers can be
+stored in a much more compact way. VarInt encoding is frequently used with delta-encoding if numbers are stored in the
+ascending order. This way all the numbers are smaller by magnitude, hence better compression.
+
+Stream VByte working using two data streams: control stream and data stream. Control stream contains control words (1
+byte each). Each control word describe length of 4 numbers in the data stream (2 bits per number, 00 - length 1, 01 -
+length 2 and so on).
+
+- [Decoding billions of integers per second through vectorization][pub] by Daniel Lemire and Leonid Boytsov.
+- [Stream VByte: breaking new speed records for integer compression][blog-post] by Daniel Lemire
+
+[pub]: https://arxiv.org/abs/1209.2137
+[blog-post]: https://lemire.me/blog/2017/09/27/stream-vbyte-breaking-new-speed-records-for-integer-compression/
+*/
 use std::io::{self, Cursor, Read, Write};
 
 /// Stream VByte Encoder
@@ -77,19 +84,25 @@ impl<W: Write> StreamVByteEncoder<W> {
     }
 }
 
+/// Represents an object that can decode a stream of data into a buffer of fixed size. A type parameter `T` specifies /// the type of the elements in the buffer, and a constant `N` specifies the size of the buffer.
 trait Decoder<T, const N: usize> {
+    /// Decodes next elements into buffer
+    ///
+    /// Decodes up to `N` next elements into buffer and returns the number of decoded elements, or zero if end of
+    /// stream reached. There is no guarantee about buffer element past the return value. They might be left unchanged
+    /// or zeroed out by this method.
     fn decode(&mut self, buffer: &mut [T; N]) -> usize;
-}
-
-pub struct StreamVByteDecoder {
-    control_stream: Cursor<Vec<u8>>,
-    data_stream: Cursor<Vec<u8>>,
 }
 
 /// Stream VByte decoder
 ///
 /// Initialized using two streams: control stream and data streams.
 /// At the moment all data needs to be buffered into memory.
+pub struct StreamVByteDecoder {
+    control_stream: Cursor<Vec<u8>>,
+    data_stream: Cursor<Vec<u8>>,
+}
+
 impl StreamVByteDecoder {
     pub fn new(control_stream: Vec<u8>, data_stream: Vec<u8>) -> Self {
         let control_stream = Cursor::new(control_stream);
