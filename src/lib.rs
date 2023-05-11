@@ -58,17 +58,10 @@ impl<W: Write> StreamVByteEncoder<W> {
         Ok(())
     }
 
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.ensure_control_word_written()?;
-        self.data_stream.flush()?;
-        self.control_stream.flush()?;
-        Ok(())
-    }
-
     /// Returns control and data stream back to the client
     ///
     /// Flushes all pending writes and returns tuple of two streams `(control, data)`.
-    pub fn into_inner(mut self) -> io::Result<(W, W)> {
+    pub fn finish(mut self) -> io::Result<(W, W)> {
         // We need to pad last control word with zero bits if number of elements
         // not multiple of 4, otherwise last control word will not be written
         {
@@ -76,7 +69,10 @@ impl<W: Write> StreamVByteEncoder<W> {
             self.written = 4;
         }
 
-        self.flush()?;
+        self.ensure_control_word_written()?;
+        self.data_stream.flush()?;
+        self.control_stream.flush()?;
+
         Ok((*self.control_stream, *self.data_stream))
     }
 }
@@ -95,7 +91,7 @@ mod tests {
         let input: &[u32] = &[0x01, 0x0100, 0x010000, 0x01000000, 0x010000];
         let mut encoder = StreamVByteEncoder::new(data, control);
         encoder.encode(&input).unwrap();
-        let (control, data) = encoder.into_inner().unwrap();
+        let (control, data) = encoder.finish().unwrap();
 
         let data = data.into_inner();
         assert_eq!(
