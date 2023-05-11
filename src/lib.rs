@@ -1,12 +1,19 @@
-//! https://lemire.me/blog/2017/09/27/stream-vbyte-breaking-new-speed-records-for-integer-compression/
-//! https://arxiv.org/abs/1209.2137
+//! This library provides encoding/decoding primitives for Stream VByte encoding.
 //!
+//! Stream VByte encoding is a SIMD accelerated algorithm of varint decompression. It is used
+//! in a search and database systems as a way of efficiently store and stream large number of varints
+//! from a disk or main memory.
+//!
+//! The idea behind varint is not to store leading bytes of a number, so large amount of relatively small
+//! numbers can be stored in a much more compact way. Varint encoding is frequently used with delta-encoding if numbers
+//! are stored in the ascending order. This way all the numbers are smaller by magnitude, hence better compression.
+//!
+//! Original publication: [Decoding billions of integers per second through vectorization](https://arxiv.org/abs/1209.2137)
+//! by Daniel Lemire and Leonid Boytsov. Blog post by Daniel Lemire:
+//! [Stream VByte: breaking new speed records for integer compression](https://lemire.me/blog/2017/09/27/stream-vbyte-breaking-new-speed-records-for-integer-compression/)
 use std::io::{self, Write};
 
-fn main() {
-    println!("Hello, world!");
-}
-
+/// Stream VByte Encoder
 pub struct StreamVByteEncoder<W> {
     data_stream: Box<W>,
     control_stream: Box<W>,
