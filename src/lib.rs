@@ -18,7 +18,7 @@ length 2 and so on).
 [pub]: https://arxiv.org/abs/1209.2137
 [blog-post]: https://lemire.me/blog/2017/09/27/stream-vbyte-breaking-new-speed-records-for-integer-compression/
 */
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Write};
 
 /// Stream VByte Encoder
 pub struct StreamVByteEncoder<W> {
@@ -99,41 +99,42 @@ trait Decoder<T, const N: usize> {
 /// Initialized using two streams: control stream and data streams.
 /// At the moment all data needs to be buffered into memory.
 pub struct StreamVByteDecoder {
-    control_stream: Cursor<Vec<u8>>,
-    data_stream: Cursor<Vec<u8>>,
+    control_stream: Vec<u8>,
+    control_stream_pos: usize,
+    data_stream: Vec<u8>,
+    data_stream_pos: usize,
 }
 
 impl StreamVByteDecoder {
     pub fn new(control_stream: Vec<u8>, data_stream: Vec<u8>) -> Self {
-        let control_stream = Cursor::new(control_stream);
-        let data_stream = Cursor::new(data_stream);
         Self {
             control_stream,
+            control_stream_pos: 0,
             data_stream,
+            data_stream_pos: 0,
         }
     }
 }
 
 impl Decoder<u32, 4> for StreamVByteDecoder {
     fn decode(&mut self, buffer: &mut [u32; 4]) -> usize {
-        let mut control_word = [0u8];
-        let size = self.control_stream.read(&mut control_word).unwrap();
-        if size == 0 {
+        let Some(control_word) = self.control_stream.get(self.control_stream_pos) else {
             return 0;
-        }
-        let lengts = byte_to_4_length(control_word[0]);
+        };
+        self.control_stream_pos += 1;
+        let lengts = byte_to_4_length(*control_word);
         for (i, (item, len)) in buffer.iter_mut().zip(lengts.iter()).enumerate() {
+            let len = *len as usize;
             let mut be_bytes = [0u8; 4];
 
-            // Reading exactly length bytes from data stream into corresponding byte positions of a number
-            let result = self
-                .data_stream
-                .read_exact(&mut be_bytes[4 - *len as usize..]);
-            match result {
-                Ok(_) => *item = u32::from_be_bytes(be_bytes),
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return i,
-                Err(e) => panic!("Err: {}", e),
+            let pos = self.data_stream_pos;
+            if pos + len > self.data_stream.len() {
+                return i;
             }
+            // Reading exactly length bytes from data stream into corresponding byte positions of a number
+            be_bytes[4 - len..].copy_from_slice(&self.data_stream[pos..pos + len]);
+            self.data_stream_pos += len;
+            *item = u32::from_be_bytes(be_bytes);
         }
         4
     }
