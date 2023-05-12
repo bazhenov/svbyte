@@ -20,6 +20,8 @@ length 2 and so on).
 */
 use std::io::{self, Write};
 
+pub const MASKS: [u128; 256] = shuffle_masks();
+
 /// Stream VByte Encoder
 pub struct StreamVByteEncoder<W> {
     data_stream: Box<W>,
@@ -157,15 +159,8 @@ fn byte_to_4_length(input: u8) -> [u8; 4] {
 /**
 Prepares shuffle mask for decoding a single `u32` using `pshufb` instruction
 
-Shuffling mask for a single `u32` consist of 4 bytes. 4 lower bits of each byte address the corresponding
-bytes in a `__m128` register (0-15). If MSB in byte is set, than corresponding byte in output register will be zeroed out.
-
-`len` parameter is describing the length of decoded `u32` in the input register. `offset` parameter is
-describing the offset in the register. It is the sum of all previous length in the input register.
-
-See [`_mm_shuffle_epi8()`][_mm_shuffle_epi8] documentation.
-
-[_mm_shuffle_epi8]: https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=shuffle_epi8&ig_expand=6097
+`len` parameter is describing the length of decoded `u32` in the input register (1-4). `offset` parameter is
+describing the base offset in the register. It is the sum of all previous number lengths loaded in the input register.
 */
 const fn u32_shuffle_mask(len: usize, offset: usize) -> u32 {
     const PZ: u8 = 0b10000000;
@@ -184,22 +179,50 @@ const fn u32_shuffle_mask(len: usize, offset: usize) -> u32 {
     }
 }
 
+/**
+Preparing shuffling masks for `pshufb` SSE instructions
+
+`pshufb` (`_mm_shuffle_epi8()`) allows to shuffle bytes around in a `__mm128` register. Shuffle mask consist of 16
+bytes. Each byte describe byte index in input register which should be copied to corresponding byte in the output
+register. For addressing 16 bytes we need log(16) = 4 bits. So bits 0:3 of each byte are storing input register byte
+index. MSB of each byte indicating if corresponding byte in output register should be zeroed out. 4 least significant
+bits are non effective if MSB is set.
+
+```graph
+Byte offsets:              0        1        2        3        4 ... 15
+Input register:         0x03     0x15     0x22     0x19     0x08 ...
+                         |                 |        |        |
+                         |        +--------+        |        |
+                         |        |                 |        |
+                         |        |          +---------------+
+                         |        |          |      |
+                         +-----------------------------------+
+                                  |          |      |        |
+Mask register:      10000000 00000010 00000100 00000011 00000000 ...
+Output register:        0x00     0x22     0x08     0x19     0x03 ...
+```
+
+See [`_mm_shuffle_epi8()`][_mm_shuffle_epi8] documentation.
+
+[_mm_shuffle_epi8]: https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=shuffle_epi8&ig_expand=6097
+*/
 const fn shuffle_masks() -> [u128; 256] {
     let mut result = [0u128; 256];
 
-    let mut a = 0;
-    while a < 4 {
-        let mut b = 0;
-        while b < 4 {
-            let mut c = 0;
-            while c < 4 {
-                let mut d = 0;
-                while d < 4 {
-                    let a_mask = u32_shuffle_mask(a + 1, 0) as u128;
-                    let b_mask = u32_shuffle_mask(b + 1, a + 1) as u128;
-                    let c_mask = u32_shuffle_mask(c + 1, a + b + 2) as u128;
-                    let d_mask = u32_shuffle_mask(d + 1, a + b + c + 3) as u128;
-                    let idx = a << 6 | b << 4 | c << 2 | d;
+    let mut a = 1;
+    while a <= 4 {
+        let mut b = 1;
+        while b <= 4 {
+            let mut c = 1;
+            while c <= 4 {
+                let mut d = 1;
+                while d <= 4 {
+                    let a_mask = u32_shuffle_mask(a, 0) as u128;
+                    let b_mask = u32_shuffle_mask(b, a) as u128;
+                    let c_mask = u32_shuffle_mask(c, a + b) as u128;
+                    let d_mask = u32_shuffle_mask(d, a + b + c) as u128;
+                    // counting in the index must be 0 based (eg. length of 1 is `00`, not `01`), hence `a - 1`
+                    let idx = (a - 1) << 6 | (b - 1) << 4 | (c - 1) << 2 | (d - 1);
                     let mask = a_mask << 96 | b_mask << 64 | c_mask << 32 | d_mask;
                     result[idx] = mask;
                     d += 1;
