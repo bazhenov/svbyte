@@ -152,10 +152,51 @@ fn byte_to_4_length(input: u8) -> [u8; 4] {
     ]
 }
 
+// const MASK: u32 = create_mask(1, 4);
+
+/**
+Prepares shuffle mask for decoding a single `u32` using `pshufb` instruction
+
+Shuffling mask for a single `u32` consist of 4 bytes. 4 lower bits of each byte address the corresponding
+bytes in a `__m128` register (0-15). If MSB in byte is set, than corresponding byte in output register will be zeroed out.
+
+`len` parameter is describing the length of decoded `u32` in the input register. `offset` parameter is
+describing the offset in the register. It is the sum of all previous length in the input register.
+
+See [`_mm_shuffle_epi8()`][_mm_shuffle_epi8] documentation.
+
+[_mm_shuffle_epi8]: https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=shuffle_epi8&ig_expand=6097
+*/
+const fn u32_shuffle_mask(len: usize, offset: usize) -> u32 {
+    const PZ: u8 = 0b10000000;
+    assert!(offset < 16, "Offset should be <16");
+    let offset = offset as u8;
+    let p1 = 1 + offset;
+    let p2 = 2 + offset;
+    let p3 = 3 + offset;
+    let p4 = 4 + offset;
+    match len {
+        1 => u32::from_be_bytes([PZ, PZ, PZ, p1]),
+        2 => u32::from_be_bytes([PZ, PZ, p1, p2]),
+        3 => u32::from_be_bytes([PZ, p1, p2, p3]),
+        4 => u32::from_be_bytes([p1, p2, p3, p4]),
+        _ => panic!("Length of u32 is 1..=4 bytes"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn check_create_mask() {
+        assert_eq!(u32_shuffle_mask(1, 0), 0x8080_8001);
+        assert_eq!(u32_shuffle_mask(2, 0), 0x8080_0102);
+
+        assert_eq!(u32_shuffle_mask(1, 3), 0x8080_8004);
+        assert_eq!(u32_shuffle_mask(2, 3), 0x8080_0405);
+    }
 
     #[test]
     fn check_encode() {
