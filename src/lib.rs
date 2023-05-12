@@ -20,7 +20,7 @@ length 2 and so on).
 */
 use std::io::{self, Write};
 
-pub const MASKS: [u128; 256] = shuffle_masks();
+pub const MASKS: [u128; 256] = u32_shuffle_masks();
 
 /// Stream VByte Encoder
 pub struct StreamVByteEncoder<W> {
@@ -206,7 +206,7 @@ See [`_mm_shuffle_epi8()`][_mm_shuffle_epi8] documentation.
 
 [_mm_shuffle_epi8]: https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=shuffle_epi8&ig_expand=6097
 */
-const fn shuffle_masks() -> [u128; 256] {
+const fn u32_shuffle_masks() -> [u128; 256] {
     let mut result = [0u128; 256];
 
     let mut a = 1;
@@ -217,13 +217,17 @@ const fn shuffle_masks() -> [u128; 256] {
             while c <= 4 {
                 let mut d = 1;
                 while d <= 4 {
-                    let a_mask = u32_shuffle_mask(a, 0) as u128;
-                    let b_mask = u32_shuffle_mask(b, a) as u128;
-                    let c_mask = u32_shuffle_mask(c, a + b) as u128;
-                    let d_mask = u32_shuffle_mask(d, a + b + c) as u128;
+                    let mut mask = 0;
+                    mask |= u32_shuffle_mask(a, 0) as u128;
+                    mask <<= 32;
+                    mask |= u32_shuffle_mask(b, a) as u128;
+                    mask <<= 32;
+                    mask |= u32_shuffle_mask(c, a + b) as u128;
+                    mask <<= 32;
+                    mask |= u32_shuffle_mask(d, a + b + c) as u128;
+
                     // counting in the index must be 0 based (eg. length of 1 is `00`, not `01`), hence `a - 1`
                     let idx = (a - 1) << 6 | (b - 1) << 4 | (c - 1) << 2 | (d - 1);
-                    let mask = a_mask << 96 | b_mask << 64 | c_mask << 32 | d_mask;
                     result[idx] = mask;
                     d += 1;
                 }
@@ -252,7 +256,7 @@ mod tests {
 
     #[test]
     fn check_shuffle_masks() {
-        let masks = shuffle_masks();
+        let masks = u32_shuffle_masks();
         assert_eq!(masks[0b00000000], 0x80808000_80808001_80808002_80808003); // Lengths 1, 1, 1, 1
         assert_eq!(masks[0b11111111], 0x00010203_04050607_08090a0b_0c0d0e0f); // Lengths 4, 1, 4, 1
         assert_eq!(masks[0b11001100], 0x00010203_80808004_05060708_80808009); // Lengths 4, 1, 4, 1
@@ -296,6 +300,7 @@ mod tests {
         }
     }
 
+    /// Creates and returns control and data stream for a given slice of numbers
     fn encode_values(input: &[u32]) -> (Vec<u8>, Vec<u8>) {
         let mut encoder = StreamVByteEncoder::new(Cursor::new(vec![]), Cursor::new(vec![]));
         encoder.encode(&input).unwrap();
