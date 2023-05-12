@@ -171,10 +171,10 @@ const fn u32_shuffle_mask(len: usize, offset: usize) -> u32 {
     const PZ: u8 = 0b10000000;
     assert!(offset < 16, "Offset should be <16");
     let offset = offset as u8;
-    let p1 = 1 + offset;
-    let p2 = 2 + offset;
-    let p3 = 3 + offset;
-    let p4 = 4 + offset;
+    let p1 = 0 + offset;
+    let p2 = 1 + offset;
+    let p3 = 2 + offset;
+    let p4 = 3 + offset;
     match len {
         1 => u32::from_be_bytes([PZ, PZ, PZ, p1]),
         2 => u32::from_be_bytes([PZ, PZ, p1, p2]),
@@ -184,6 +184,35 @@ const fn u32_shuffle_mask(len: usize, offset: usize) -> u32 {
     }
 }
 
+const fn shuffle_masks() -> [u128; 256] {
+    let mut result = [0u128; 256];
+
+    let mut a = 0;
+    while a < 4 {
+        let mut b = 0;
+        while b < 4 {
+            let mut c = 0;
+            while c < 4 {
+                let mut d = 0;
+                while d < 4 {
+                    let a_mask = u32_shuffle_mask(a + 1, 0) as u128;
+                    let b_mask = u32_shuffle_mask(b + 1, a + 1) as u128;
+                    let c_mask = u32_shuffle_mask(c + 1, a + b + 2) as u128;
+                    let d_mask = u32_shuffle_mask(d + 1, a + b + c + 3) as u128;
+                    let idx = a << 6 | b << 4 | c << 2 | d;
+                    let mask = a_mask << 96 | b_mask << 64 | c_mask << 32 | d_mask;
+                    result[idx] = mask;
+                    d += 1;
+                }
+                c += 1;
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,11 +220,20 @@ mod tests {
 
     #[test]
     fn check_create_mask() {
-        assert_eq!(u32_shuffle_mask(1, 0), 0x8080_8001);
-        assert_eq!(u32_shuffle_mask(2, 0), 0x8080_0102);
+        assert_eq!(u32_shuffle_mask(1, 0), 0x8080_8000);
+        assert_eq!(u32_shuffle_mask(2, 0), 0x8080_0001);
 
-        assert_eq!(u32_shuffle_mask(1, 3), 0x8080_8004);
-        assert_eq!(u32_shuffle_mask(2, 3), 0x8080_0405);
+        assert_eq!(u32_shuffle_mask(1, 3), 0x8080_8003);
+        assert_eq!(u32_shuffle_mask(2, 3), 0x8080_0304);
+    }
+
+    #[test]
+    fn check_shuffle_masks() {
+        let masks = shuffle_masks();
+        assert_eq!(masks[0b00000000], 0x80808000_80808001_80808002_80808003); // Lengths 1, 1, 1, 1
+        assert_eq!(masks[0b11111111], 0x00010203_04050607_08090a0b_0c0d0e0f); // Lengths 4, 1, 4, 1
+        assert_eq!(masks[0b11001100], 0x00010203_80808004_05060708_80808009); // Lengths 4, 1, 4, 1
+        assert_eq!(masks[0b11100100], 0x00010203_80040506_80800708_80808009); // Lengths 4, 3, 2, 1
     }
 
     #[test]
