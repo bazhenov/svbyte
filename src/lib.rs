@@ -10,8 +10,8 @@ stored in a much more compact way. VarInt encoding is frequently used with delta
 ascending order. This way all the numbers are smaller by magnitude, hence better compression.
 
 Stream VByte working using two data streams: control stream and data stream. Control stream contains control words (1
-byte each). Each control word describe length of 4 numbers in the data stream (2 bits per number, 00 - length 1, 01 -
-length 2 and so on).
+byte each). Each control word describe length of 4 numbers in the data stream (2 bits per number, `00` - length 1,
+`01` - length 2 and so on).
 
 - [Decoding billions of integers per second through vectorization][pub] by Daniel Lemire and Leonid Boytsov.
 - [Stream VByte: breaking new speed records for integer compression][blog-post] by Daniel Lemire
@@ -25,9 +25,14 @@ use std::io::{self, Write};
 #[allow(non_camel_case_types)]
 type u32x4 = [u32; 4];
 
+/// Shuffle masks and correspinding length of encoded numbers
+///
+/// For more information see documentation to [`u32_shuffle_masks`]
+///
+/// [`u32_shuffle_masks`]: u32_shuffle_masks
 const MASKS: [(u32x4, u8); 256] = u32_shuffle_masks();
 
-/// SIMD version of Stream VByte decoder
+/// Stream VByte decoder
 ///
 /// Initialized using two streams: control stream and data streams.
 /// At the moment all data needs to be buffered into memory.
