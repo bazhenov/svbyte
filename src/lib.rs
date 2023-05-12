@@ -87,13 +87,27 @@ impl<W: Write> StreamVByteEncoder<W> {
 }
 
 /// Represents an object that can decode a stream of data into a buffer of fixed size. A type parameter `T` specifies /// the type of the elements in the buffer, and a constant `N` specifies the size of the buffer.
-trait Decoder<T, const N: usize> {
+trait Decoder<T: Default + Copy, const N: usize> {
     /// Decodes next elements into buffer
     ///
     /// Decodes up to `N` next elements into buffer and returns the number of decoded elements, or zero if end of
     /// stream reached. There is no guarantee about buffer element past the return value. They might be left unchanged
     /// or zeroed out by this method.
     fn decode(&mut self, buffer: &mut [T; N]) -> usize;
+
+    fn to_vec(mut self) -> Vec<T>
+    where
+        Self: Sized,
+    {
+        let mut buffer = [Default::default(); N];
+        let mut result = vec![];
+        let mut len = self.decode(&mut buffer);
+        while len > 0 {
+            result.extend(&buffer[..len]);
+            len = self.decode(&mut buffer);
+        }
+        return result;
+    }
 }
 
 /// Stream VByte decoder
@@ -243,6 +257,7 @@ const fn u32_shuffle_masks() -> [u128; 256] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{thread_rng, Rng};
     use std::io::Cursor;
 
     #[test]
@@ -298,6 +313,19 @@ mod tests {
             assert_eq!(decoded, len);
             assert_eq!(buffer[..len], *chunk);
         }
+    }
+
+    #[test]
+    fn check_functional_encode_decode() {
+        let mut rng = thread_rng();
+        let len = rng.gen_range(1..20);
+        let mut input: Vec<u32> = vec![];
+        input.resize(len, 0);
+        rng.fill(&mut input[..]);
+        let (control, data) = encode_values(&input);
+
+        let output = StreamVByteDecoder::new(control, data).to_vec();
+        assert_eq!(input, output);
     }
 
     /// Creates and returns control and data stream for a given slice of numbers
