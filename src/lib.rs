@@ -172,28 +172,26 @@ Data format follows this structure:
 ```
 
 - `MAGIC` is always 0x0B0D;
-- `CS SIZE` is the size of control segment in bytes;
-- `DS SIZE` is the size of data segment in bytes;
-- `CS` and `DS` and control and data segment
+- `CS SIZE` is the size of control stream in bytes;
+- `DS SIZE` is the size of data stream in bytes;
+- `CS` and `DS` and control and data streams
 
 Segment header (`MAGIC`, `CS SIZE`, `DS SIZE`) is enough to calculate the whole segment size.
 Segments follows each other until EOF of a stream reached.
 */
 pub struct StreamVByteEncoder<W> {
-    data_stream: Box<W>,
-    control_stream: Box<W>,
-    control_word: u8,
+    data_stream: Vec<u8>,
+    control_stream: Vec<u8>,
+    output: Box<W>,
     written: u8,
 }
 
 impl<W: Write> StreamVByteEncoder<W> {
-    pub fn new(data: W, control: W) -> Self {
-        let data = Box::new(data);
-        let control = Box::new(control);
+    pub fn new(output: W) -> Self {
         Self {
-            data_stream: data,
-            control_stream: control,
-            control_word: 0,
+            data_stream: vec![],
+            control_stream: vec![],
+            output: Box::new(output),
             written: 0,
         }
     }
@@ -202,43 +200,75 @@ impl<W: Write> StreamVByteEncoder<W> {
         for n in input {
             let bytes: [u8; 4] = n.to_be_bytes();
             let length = 4 - n.leading_zeros() as u8 / 8;
-            assert!(length <= 4);
+            debug_assert!(1 <= length && length <= 4);
 
-            self.control_word <<= 2;
-            self.control_word |= length - 1;
+            let control_word = self.get_control_word();
+            *control_word <<= 2;
+            *control_word |= length - 1;
+            self.written += 1;
 
             self.data_stream.write_all(&bytes[4 - length as usize..])?;
-            self.written += 1;
-            self.ensure_control_word_written()?;
+            self.write_segment_if_needed()?;
         }
         Ok(())
     }
 
-    fn ensure_control_word_written(&mut self) -> io::Result<()> {
-        if self.written == 4 {
-            self.control_stream.write_all(&[self.control_word])?;
-            self.control_word = 0;
+    fn get_control_word(&mut self) -> &mut u8 {
+        if self.written % 4 == 0 {
+            self.control_stream.push(0);
+        }
+        self.control_stream.last_mut().unwrap()
+    }
+
+    fn write_segment_if_needed(&mut self) -> io::Result<()> {
+        const MAX_SEGMENT_SIZE: usize = 16 * 1024;
+        let segment_size = 2 // magic size
+            + 4 // control stream size
+            + 4 // data stream size
+            + self.data_stream.len() + self.control_stream.len();
+        if segment_size >= MAX_SEGMENT_SIZE {
+            self.write_segment()?;
+
             self.written = 0;
+            self.data_stream.clear();
+            self.control_stream.clear();
         }
         Ok(())
     }
 
-    /// Returns control and data stream back to the client
-    ///
-    /// Flushes all pending writes and returns tuple of two streams `(control, data)`.
-    pub fn finish(mut self) -> io::Result<(W, W)> {
-        // We need to pad last control word with zero bits if number of elements
-        // not multiple of 4, otherwise last control word will not be written
-        if self.written > 0 {
-            self.control_word <<= 2 * (4 - self.written);
-            self.written = 4;
+    fn write_segment(&mut self) -> io::Result<()> {
+        const MAGIC: u16 = 0x0B0D;
+
+        let tail = self.written % 4;
+        // we need to binary shift last control left if number of elements
+        // not multiple of 4, otherwise last control will be misaligned
+        if tail > 0 {
+            let control_word = self.control_stream.last_mut().unwrap();
+            *control_word <<= 2 * (4 - tail);
         }
 
-        self.ensure_control_word_written()?;
-        self.data_stream.flush()?;
-        self.control_stream.flush()?;
+        self.output.write_all(&MAGIC.to_be_bytes())?;
 
-        Ok((*self.control_stream, *self.data_stream))
+        debug_assert!(self.control_stream.len() < u32::MAX as usize);
+        let cs_len = (self.control_stream.len() as u32).to_be_bytes();
+        self.output.write_all(&cs_len)?;
+
+        debug_assert!(self.data_stream.len() < u32::MAX as usize);
+        let ds_len = (self.data_stream.len() as u32).to_be_bytes();
+        self.output.write_all(&ds_len)?;
+
+        self.output.write_all(&self.control_stream)?;
+        self.output.write_all(&self.data_stream)?;
+
+        Ok(())
+    }
+
+    /// Returns output stream stream back to the client
+    ///
+    /// All pending writes are not *flushed*. It is a responsibility of a callee to flush if needed.
+    pub fn finish(mut self) -> io::Result<(Vec<u8>, Vec<u8>, W)> {
+        self.write_segment()?;
+        Ok((self.control_stream, self.data_stream, *self.output))
     }
 }
 
@@ -353,10 +383,11 @@ mod tests {
 
     /// Creates and returns control and data stream for a given slice of numbers
     pub fn encode_values(input: &[u32]) -> (Vec<u8>, Vec<u8>) {
-        let mut encoder = StreamVByteEncoder::new(Cursor::new(vec![]), Cursor::new(vec![]));
+        let mut encoder = StreamVByteEncoder::new(Cursor::new(vec![]));
         encoder.encode(&input).unwrap();
-        let (control, data) = encoder.finish().unwrap();
-        (control.into_inner(), data.into_inner())
+        let (control, data, io) = encoder.finish().unwrap();
+        assert!(io.into_inner().len() > 0);
+        (control, data)
     }
 
     /// Decoding control byte to 4 corresponding length
