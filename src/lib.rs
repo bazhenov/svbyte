@@ -91,6 +91,8 @@ impl<R: BufRead> StreamVByteDecoder<R> {
 }
 
 /// Reads the segment, checks segment header and copies streams into corresponding buffers
+///
+/// Returns the number of elements encoded in the segment
 fn read_segment(input: &mut impl BufRead, cs: &mut Vec<u8>, ds: &mut Vec<u8>) -> io::Result<usize> {
     let mut buf = [0u8; 2];
     input.read_exact(&mut buf)?;
@@ -131,7 +133,7 @@ impl<R: BufRead> Decoder<u32, 4> for StreamVByteDecoder<R> {
             return 0;
         };
 
-        let (ref mask, len) = MASKS[*control_word as usize];
+        let (ref mask, encoded_len) = MASKS[*control_word as usize];
         let input = &self.data_stream[self.data_stream_pos];
         unsafe {
             let mask = _mm_loadu_epi8(mask as *const u32x4 as *const i8);
@@ -140,8 +142,8 @@ impl<R: BufRead> Decoder<u32, 4> for StreamVByteDecoder<R> {
             _mm_store_epi32(buffer as *mut u32x4 as *mut i32, answer);
         }
         let elements_decoded = self.elements_left.min(4);
-        self.elements_left = self.elements_left.saturating_sub(4);
-        self.data_stream_pos += len as usize;
+        self.elements_left -= elements_decoded;
+        self.data_stream_pos += encoded_len as usize;
         self.control_stream_pos += 1;
         elements_decoded
     }
