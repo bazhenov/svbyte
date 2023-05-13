@@ -276,7 +276,7 @@ impl<W: Write> StreamVByteEncoder<W> {
         for n in input {
             let bytes: [u8; 4] = n.to_be_bytes();
             let length = 4 - n.leading_zeros() as u8 / 8;
-            debug_assert!(1 <= length && length <= 4);
+            debug_assert!((1..=4).contains(&length));
 
             let control_word = self.get_control_word();
             *control_word <<= 2;
@@ -440,6 +440,7 @@ mod tests {
         assert_eq!(output, input);
     }
 
+    #[allow(clippy::unusual_byte_groupings)]
     #[test]
     fn check_create_mask() {
         assert_eq!(u32_shuffle_mask(1, 0), 0x808080_00);
@@ -449,6 +450,7 @@ mod tests {
         assert_eq!(u32_shuffle_mask(2, 3), 0x8080_0304);
     }
 
+    #[allow(clippy::unusual_byte_groupings)]
     #[test]
     fn check_shuffle_masks() {
         let masks = u32_shuffle_masks();
@@ -477,7 +479,7 @@ mod tests {
     /// Creates and returns control and data stream for a given slice of numbers
     pub fn encode_values(input: &[u32]) -> (Vec<u8>, Vec<u8>, impl BufRead) {
         let mut encoder = StreamVByteEncoder::new(Cursor::new(vec![]));
-        encoder.encode(&input).unwrap();
+        encoder.encode(input).unwrap();
         let mut source = encoder.finish().unwrap();
         let mut cs = vec![];
         let mut ds = vec![];

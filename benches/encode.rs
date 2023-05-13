@@ -16,7 +16,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         b.iter_batched(
             || StreamVByteEncoder::new(Cursor::new(vec![])),
             |mut e| {
-                e.encode(&input);
+                e.encode(&input).unwrap();
                 e.finish()
             },
             BatchSize::SmallInput,
