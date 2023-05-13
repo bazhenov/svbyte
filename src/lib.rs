@@ -44,6 +44,7 @@ pub struct StreamVByteDecoder<R> {
     data_stream: Vec<u8>,
     data_stream_pos: usize,
     source: Box<R>,
+    elements_left: usize,
 }
 
 impl<R: BufRead> StreamVByteDecoder<R> {
@@ -54,42 +55,76 @@ impl<R: BufRead> StreamVByteDecoder<R> {
             data_stream: vec![],
             data_stream_pos: 0,
             source: Box::new(source),
+            elements_left: 0,
         }
     }
 
     fn refill(&mut self) -> io::Result<()> {
-        let mut buf = [0u8; 2];
-        self.source.read_exact(&mut buf)?;
-        let magic = u16::from_be_bytes(buf);
-
-        assert!(
-            magic == SEGMENT_MAGIC,
-            "Expected magic: {}, got: {}",
-            SEGMENT_MAGIC,
-            magic,
+        debug_assert!(
+            self.elements_left == 0,
+            "Should be 0, got: {}",
+            self.elements_left
         );
-
-        let mut buf = [0u8; 4];
-        self.source.read_exact(&mut buf)?;
-        let cs_length = u32::from_be_bytes(buf) as usize;
-
-        self.source.read_exact(&mut buf)?;
-        let ds_length = u32::from_be_bytes(buf) as usize;
-
-        self.control_stream.resize(cs_length, 0);
-        self.source
-            .read_exact(&mut self.control_stream[..cs_length])?;
-
-        self.data_stream.resize(ds_length, 0);
-        self.source.read_exact(&mut self.data_stream[..ds_length])?;
-
-        Ok(())
+        self.control_stream_pos = 0;
+        self.data_stream_pos = 0;
+        let result = read_segment(
+            &mut self.source,
+            &mut self.control_stream,
+            &mut self.data_stream,
+        );
+        match result {
+            Ok(elements) => {
+                self.elements_left = elements;
+                Ok(())
+            }
+            Err(e) => {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    self.control_stream.clear();
+                    self.data_stream.clear();
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
+}
+
+/// Reads the segment, checks segment header and copies streams into corresponding buffers
+fn read_segment(input: &mut impl BufRead, cs: &mut Vec<u8>, ds: &mut Vec<u8>) -> io::Result<usize> {
+    let mut buf = [0u8; 2];
+    input.read_exact(&mut buf)?;
+    let magic = u16::from_be_bytes(buf);
+
+    assert!(
+        magic == SEGMENT_MAGIC,
+        "Expected magic: {}, got: {}",
+        SEGMENT_MAGIC,
+        magic,
+    );
+
+    let mut buf = [0u8; 4];
+    input.read_exact(&mut buf)?;
+    let number_of_elements = u32::from_be_bytes(buf) as usize;
+
+    input.read_exact(&mut buf)?;
+    let cs_length = u32::from_be_bytes(buf) as usize;
+
+    input.read_exact(&mut buf)?;
+    let ds_length = u32::from_be_bytes(buf) as usize;
+
+    cs.resize(cs_length, 0);
+    input.read_exact(&mut cs[..cs_length])?;
+
+    ds.resize(ds_length, 0);
+    input.read_exact(&mut ds[..ds_length])?;
+
+    Ok(number_of_elements)
 }
 
 impl<R: BufRead> Decoder<u32, 4> for StreamVByteDecoder<R> {
     fn decode(&mut self, buffer: &mut u32x4) -> usize {
-        if self.control_stream.is_empty() {
+        if self.control_stream_pos >= self.control_stream.len() {
             self.refill().unwrap();
         }
         let Some(control_word) = self.control_stream.get(self.control_stream_pos) else {
@@ -104,9 +139,11 @@ impl<R: BufRead> Decoder<u32, 4> for StreamVByteDecoder<R> {
             let answer = _mm_shuffle_epi8(input, mask);
             _mm_store_epi32(buffer as *mut u32x4 as *mut i32, answer);
         }
+        let elements_decoded = self.elements_left.min(4);
+        self.elements_left = self.elements_left.saturating_sub(4);
         self.data_stream_pos += len as usize;
         self.control_stream_pos += 1;
-        4
+        elements_decoded
     }
 }
 
@@ -202,15 +239,16 @@ Encodes a stream of numbers and saves them in a [`Write`] output stream.
 Data format follows this structure:
 
 ```diagram
-┌───────┬─────────┬─────────┬────────┬────────┐
-│ MAGIC │ CS SIZE │ DS SIZE │ CS ... │ DS ... │
-└───────┴─────────┴─────────┴────────┴────────┘
+┌───────┬───────┬─────────┬─────────┬────────┬────────┐
+│ MAGIC │ COUNT │ CS SIZE │ DS SIZE │ CS ... │ DS ... │
+└───────┴───────┴─────────┴─────────┴────────┴────────┘
 ```
 
 - `MAGIC` is always 0x0B0D;
-- `CS SIZE` is the size of control stream in bytes;
-- `DS SIZE` is the size of data stream in bytes;
-- `CS` and `DS` and control and data streams
+- `COUNT` the number of elements encoded in the segment (u32);
+- `CS SIZE` is the size of control stream in bytes (u32);
+- `DS SIZE` is the size of data stream in bytes (u32);
+- `CS` and `DS` and control and data streams.
 
 Segment header (`MAGIC`, `CS SIZE`, `DS SIZE`) is enough to calculate the whole segment size.
 Segments follows each other until EOF of a stream reached.
@@ -219,7 +257,7 @@ pub struct StreamVByteEncoder<W> {
     data_stream: Vec<u8>,
     control_stream: Vec<u8>,
     output: Box<W>,
-    written: u8,
+    written: usize,
 }
 
 impl<W: Write> StreamVByteEncoder<W> {
@@ -259,6 +297,7 @@ impl<W: Write> StreamVByteEncoder<W> {
     fn write_segment_if_needed(&mut self) -> io::Result<()> {
         const MAX_SEGMENT_SIZE: usize = 16 * 1024;
         let segment_size = 2 // magic size
+            + 4 // stream size
             + 4 // control stream size
             + 4 // data stream size
             + self.data_stream.len() + self.control_stream.len();
@@ -283,11 +322,15 @@ impl<W: Write> StreamVByteEncoder<W> {
 
         self.output.write_all(&SEGMENT_MAGIC.to_be_bytes())?;
 
-        debug_assert!(self.control_stream.len() < u32::MAX as usize);
+        debug_assert!(self.written <= u32::MAX as usize);
+        let number_of_elements = (self.written as u32).to_be_bytes();
+        self.output.write_all(&number_of_elements)?;
+
+        debug_assert!(self.control_stream.len() <= u32::MAX as usize);
         let cs_len = (self.control_stream.len() as u32).to_be_bytes();
         self.output.write_all(&cs_len)?;
 
-        debug_assert!(self.data_stream.len() < u32::MAX as usize);
+        debug_assert!(self.data_stream.len() <= u32::MAX as usize);
         let ds_len = (self.data_stream.len() as u32).to_be_bytes();
         self.output.write_all(&ds_len)?;
 
@@ -300,9 +343,9 @@ impl<W: Write> StreamVByteEncoder<W> {
     /// Returns output stream stream back to the client
     ///
     /// All pending writes are not *flushed*. It is a responsibility of a callee to flush if needed.
-    pub fn finish(mut self) -> io::Result<(Vec<u8>, Vec<u8>, W)> {
+    pub fn finish(mut self) -> io::Result<W> {
         self.write_segment()?;
-        Ok((self.control_stream, self.data_stream, *self.output))
+        Ok(*self.output)
     }
 }
 
@@ -333,8 +376,8 @@ trait Decoder<T: Default + Copy, const N: usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{thread_rng, Rng};
-    use std::io::{Cursor, Seek};
+    use rand::{rngs::ThreadRng, thread_rng, Rng};
+    use std::io::{Cursor, Seek, SeekFrom};
 
     #[test]
     fn check_encode() {
@@ -359,27 +402,40 @@ mod tests {
     }
 
     #[test]
-    fn check_functional_encode_decode() {
+    fn check_small_functional_encode_decode() {
         let mut rng = thread_rng();
         for _ in 0..1000 {
             let len = rng.gen_range(1..20);
-            let mut input: Vec<u32> = vec![];
-            input.resize(len, 0);
-            rng.fill(&mut input[..]);
-            let (_, _, encoded) = encode_values(&input);
-            let output = StreamVByteDecoder::new(encoded).to_vec();
-            // TODO there should be length manipulation here
-            assert_eq!(input, output[..input.len()]);
+            check_encode_decode_cycle(&mut rng, len);
         }
+    }
+
+    #[test]
+    fn check_large_functional_encode_decode() {
+        let mut rng = thread_rng();
+        for _ in 0..10 {
+            let len = rng.gen_range(10000..20000);
+            check_encode_decode_cycle(&mut rng, len);
+        }
+    }
+
+    fn check_encode_decode_cycle(rng: &mut ThreadRng, len: usize) {
+        let mut input: Vec<u32> = vec![];
+        input.resize(len, 0);
+        rng.fill(&mut input[..]);
+        let (_, _, encoded) = encode_values(&input);
+        let output = StreamVByteDecoder::new(encoded).to_vec();
+        assert_eq!(input.len(), output.len());
+        assert_eq!(output, input);
     }
 
     #[test]
     fn check_decode() {
         let input = [1, 255, 1024, 2048, 0xFF000000];
         let (_, _, encoded) = encode_values(&input);
-        let result = StreamVByteDecoder::new(encoded).to_vec();
-        // TODO fix length
-        assert_eq!(input, &result[..input.len()]);
+        let output = StreamVByteDecoder::new(encoded).to_vec();
+        assert_eq!(output.len(), output.len());
+        assert_eq!(output, input);
     }
 
     #[test]
@@ -420,8 +476,12 @@ mod tests {
     pub fn encode_values(input: &[u32]) -> (Vec<u8>, Vec<u8>, impl BufRead) {
         let mut encoder = StreamVByteEncoder::new(Cursor::new(vec![]));
         encoder.encode(&input).unwrap();
-        let (cs, ds, mut source) = encoder.finish().unwrap();
-        source.seek(io::SeekFrom::Start(0));
+        let mut source = encoder.finish().unwrap();
+        let mut cs = vec![];
+        let mut ds = vec![];
+        source.seek(SeekFrom::Start(0)).unwrap();
+        read_segment(&mut source, &mut cs, &mut ds).unwrap();
+        source.seek(SeekFrom::Start(0)).unwrap();
         (cs, ds, source)
     }
 
