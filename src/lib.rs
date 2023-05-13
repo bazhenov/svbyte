@@ -352,7 +352,7 @@ impl<W: Write> StreamVByteEncoder<W> {
 }
 
 /// Represents an object that can decode a stream of data into a buffer of fixed size. A type parameter `T` specifies /// the type of the elements in the buffer, and a constant `N` specifies the size of the buffer.
-trait Decoder<T: Default + Copy, const N: usize> {
+pub trait Decoder<T: Default + Copy, const N: usize> {
     /// Decodes next elements into buffer
     ///
     /// Decodes up to `N` next elements into buffer and returns the number of decoded elements, or zero if end of
