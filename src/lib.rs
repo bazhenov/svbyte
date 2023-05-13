@@ -158,7 +158,27 @@ const fn u32_shuffle_masks() -> [(u32x4, u8); 256] {
     masks
 }
 
-/// Stream VByte Encoder
+/**
+Stream VByte Encoder
+
+Encodes a stream of numbers and saves them in a [`Write`] output stream.
+
+Data format follows this structure:
+
+```diagram
+┌───────┬─────────┬─────────┬────────┬────────┐
+│ MAGIC │ CS SIZE │ DS SIZE │ CS ... │ DS ... │
+└───────┴─────────┴─────────┴────────┴────────┘
+```
+
+- `MAGIC` is always 0x0B0D;
+- `CS SIZE` is the size of control segment in bytes;
+- `DS SIZE` is the size of data segment in bytes;
+- `CS` and `DS` and control and data segment
+
+Segment header (`MAGIC`, `CS SIZE`, `DS SIZE`) is enough to calculate the whole segment size.
+Segments follows each other until EOF of a stream reached.
+*/
 pub struct StreamVByteEncoder<W> {
     data_stream: Box<W>,
     control_stream: Box<W>,
