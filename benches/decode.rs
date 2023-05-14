@@ -7,7 +7,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     let mut rng = thread_rng();
     let mut group = c.benchmark_group("decode");
     let mut input = vec![];
-    let size = 100000;
+    let size = 100_000;
     input.resize(size, 0);
     rng.fill(&mut input[..]);
     let mut encoder = StreamVByteEncoder::new(Cursor::new(vec![]));
@@ -18,7 +18,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         b.iter_batched(
             || StreamVByteDecoder::new(Cursor::new(&data)),
             |mut d| {
-                let mut buf = [0; 4];
+                let mut buf = [0; 128];
                 while d.decode(&mut buf) > 0 {}
             },
             BatchSize::SmallInput,

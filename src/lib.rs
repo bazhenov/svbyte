@@ -125,27 +125,33 @@ fn read_segment(input: &mut impl BufRead, cs: &mut Vec<u8>, ds: &mut Vec<u8>) ->
     Ok(number_of_elements)
 }
 
-impl<R: BufRead> Decoder<u32, 4> for StreamVByteDecoder<R> {
-    fn decode(&mut self, buffer: &mut u32x4) -> usize {
+impl<R: BufRead> Decoder<u32> for StreamVByteDecoder<R> {
+    fn decode(&mut self, buffer: &mut [u32]) -> usize {
+        assert!(buffer.len() % 4 == 0, "Buffer should be devisible by 4");
         if self.control_stream_pos >= self.control_stream.len() {
             self.refill().unwrap();
         }
-        let Some(control_word) = self.control_stream.get(self.control_stream_pos) else {
-            return 0;
-        };
 
-        let (ref mask, encoded_len) = MASKS[*control_word as usize];
-        let input = &self.data_stream[self.data_stream_pos];
-        unsafe {
-            let mask = _mm_loadu_si128(mask as *const u32x4 as *const __m128i);
-            let input = _mm_loadu_si128(input as *const u8 as *const __m128i);
-            let answer = _mm_shuffle_epi8(input, mask);
-            _mm_storeu_si128(buffer as *mut u32x4 as *mut __m128i, answer);
+        let mut elements_decoded = 0;
+        for chunk in buffer.chunks_exact(4) {
+            let Some(control_word) = self.control_stream.get(self.control_stream_pos) else {
+                return elements_decoded;
+            };
+
+            let (ref mask, encoded_len) = MASKS[*control_word as usize];
+            let input = &self.data_stream[self.data_stream_pos];
+            unsafe {
+                let mask = _mm_loadu_si128(mask as *const u32x4 as *const __m128i);
+                let input = _mm_loadu_si128(input as *const u8 as *const __m128i);
+                let answer = _mm_shuffle_epi8(input, mask);
+                _mm_storeu_si128(chunk.as_ptr() as *mut __m128i, answer);
+            }
+            elements_decoded += self.elements_left.min(4);
+            self.elements_left = self.elements_left.saturating_sub(4);
+            self.data_stream_pos += encoded_len as usize;
+            self.control_stream_pos += 1;
         }
-        let elements_decoded = self.elements_left.min(4);
-        self.elements_left -= elements_decoded;
-        self.data_stream_pos += encoded_len as usize;
-        self.control_stream_pos += 1;
+
         elements_decoded
     }
 }
@@ -298,7 +304,7 @@ impl<W: Write> StreamVByteEncoder<W> {
     }
 
     fn write_segment_if_needed(&mut self) -> io::Result<()> {
-        const MAX_SEGMENT_SIZE: usize = 16 * 1024;
+        const MAX_SEGMENT_SIZE: usize = 8 * 1024;
         let segment_size = 2 // magic size
             + 4 // stream size
             + 4 // control stream size
@@ -352,20 +358,20 @@ impl<W: Write> StreamVByteEncoder<W> {
     }
 }
 
-/// Represents an object that can decode a stream of data into a buffer of fixed size. A type parameter `T` specifies /// the type of the elements in the buffer, and a constant `N` specifies the size of the buffer.
-pub trait Decoder<T: Default + Copy, const N: usize> {
+/// Represents an object that can decode a stream of data into a buffer of fixed size. A type parameter `T` specifies /// the type of the elements in the buffer.
+pub trait Decoder<T: Default + Copy> {
     /// Decodes next elements into buffer
     ///
-    /// Decodes up to `N` next elements into buffer and returns the number of decoded elements, or zero if end of
-    /// stream reached. There is no guarantee about buffer element past the return value. They might be left unchanged
-    /// or zeroed out by this method.
-    fn decode(&mut self, buffer: &mut [T; N]) -> usize;
+    /// Decodes next elements into buffer and returns the number of decoded elements, or zero if and end of the
+    /// stream is reached. There is no guarantee about buffer element past the return value. They might be
+    /// left unchanged or zeroed out by this method.
+    fn decode(&mut self, buffer: &mut [T]) -> usize;
 
     fn to_vec(mut self) -> Vec<T>
     where
         Self: Sized,
     {
-        let mut buffer = [Default::default(); N];
+        let mut buffer = [Default::default(); 16];
         let mut result = vec![];
         let mut len = self.decode(&mut buffer);
         while len > 0 {
