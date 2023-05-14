@@ -135,7 +135,7 @@ impl<R: BufRead> Decoder<u32> for StreamVByteDecoder<R> {
         let mut elements_decoded = 0;
         for chunk in buffer.chunks_exact(4) {
             let Some(control_word) = self.control_stream.get(self.control_stream_pos) else {
-                return elements_decoded;
+                break;
             };
 
             let (ref mask, encoded_len) = MASKS[*control_word as usize];
@@ -146,12 +146,13 @@ impl<R: BufRead> Decoder<u32> for StreamVByteDecoder<R> {
                 let answer = _mm_shuffle_epi8(input, mask);
                 _mm_storeu_si128(chunk.as_ptr() as *mut __m128i, answer);
             }
-            elements_decoded += self.elements_left.min(4);
-            self.elements_left = self.elements_left.saturating_sub(4);
+            elements_decoded += 4;
             self.data_stream_pos += encoded_len as usize;
             self.control_stream_pos += 1;
         }
 
+        elements_decoded = elements_decoded.min(self.elements_left);
+        self.elements_left -= elements_decoded;
         elements_decoded
     }
 }
