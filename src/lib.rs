@@ -19,7 +19,7 @@ byte each). Each control word describe length of 4 numbers in the data stream (2
 [pub]: https://arxiv.org/abs/1209.2137
 [blog-post]: https://lemire.me/blog/2017/09/27/stream-vbyte-breaking-new-speed-records-for-integer-compression/
 */
-use std::arch::x86_64::{_mm_loadu_epi8, _mm_shuffle_epi8, _mm_store_epi32};
+use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128};
 use std::io::{self, BufRead, Write};
 
 #[allow(non_camel_case_types)]
@@ -39,12 +39,12 @@ const SEGMENT_MAGIC: u16 = 0x0B0D;
 /// Initialized using two streams: control stream and data streams.
 /// At the moment all data needs to be buffered into memory.
 pub struct StreamVByteDecoder<R> {
-    control_stream: Vec<u8>,
     control_stream_pos: usize,
-    data_stream: Vec<u8>,
     data_stream_pos: usize,
-    source: Box<R>,
+    control_stream: Vec<u8>,
+    data_stream: Vec<u8>,
     elements_left: usize,
+    source: Box<R>,
 }
 
 impl<R: BufRead> StreamVByteDecoder<R> {
@@ -59,6 +59,7 @@ impl<R: BufRead> StreamVByteDecoder<R> {
         }
     }
 
+    #[inline(never)]
     fn refill(&mut self) -> io::Result<()> {
         debug_assert!(
             self.elements_left == 0,
@@ -136,10 +137,10 @@ impl<R: BufRead> Decoder<u32, 4> for StreamVByteDecoder<R> {
         let (ref mask, encoded_len) = MASKS[*control_word as usize];
         let input = &self.data_stream[self.data_stream_pos];
         unsafe {
-            let mask = _mm_loadu_epi8(mask as *const u32x4 as *const i8);
-            let input = _mm_loadu_epi8(input as *const u8 as *const i8);
+            let mask = _mm_loadu_si128(mask as *const u32x4 as *const __m128i);
+            let input = _mm_loadu_si128(input as *const u8 as *const __m128i);
             let answer = _mm_shuffle_epi8(input, mask);
-            _mm_store_epi32(buffer as *mut u32x4 as *mut i32, answer);
+            _mm_storeu_si128(buffer as *mut u32x4 as *mut __m128i, answer);
         }
         let elements_decoded = self.elements_left.min(4);
         self.elements_left -= elements_decoded;
