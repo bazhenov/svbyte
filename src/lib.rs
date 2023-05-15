@@ -34,60 +34,100 @@ const MASKS: [(u32x4, u8); 256] = u32_shuffle_masks();
 
 const SEGMENT_MAGIC: u16 = 0x0B0D;
 
-/// Stream VByte decoder
-///
-/// Initialized using two streams: control stream and data streams.
-/// At the moment all data needs to be buffered into memory.
-pub struct StreamVByteDecoder<R> {
-    control_stream_pos: usize,
-    data_stream_pos: usize,
-    control_stream: Vec<u8>,
-    data_stream: Vec<u8>,
-    elements_left: usize,
-    source: Box<R>,
+/// Provides asses to control and data streams of a segment
+pub trait Segments {
+    /// Returns:
+    ///
+    /// 1. number of encoded elements in the segment
+    /// 2. control stream of a segment
+    /// 3. data stream of a segment
+    fn next(&mut self) -> io::Result<usize>;
+    fn data_stream(&self) -> &[u8];
+    fn control_stream(&self) -> &[u8];
 }
 
-impl<R: BufRead> StreamVByteDecoder<R> {
+pub struct BufReadSegments<R> {
+    source: R,
+    control_stream: Vec<u8>,
+    data_stream: Vec<u8>,
+}
+
+impl<R> BufReadSegments<R> {
     pub fn new(source: R) -> Self {
         Self {
+            source,
             control_stream: vec![],
-            control_stream_pos: 0,
             data_stream: vec![],
-            data_stream_pos: 0,
-            source: Box::new(source),
-            elements_left: 0,
         }
     }
+}
 
-    #[inline(never)]
-    fn refill(&mut self) -> io::Result<()> {
-        debug_assert!(
-            self.elements_left == 0,
-            "Should be 0, got: {}",
-            self.elements_left
-        );
-        self.control_stream_pos = 0;
-        self.data_stream_pos = 0;
+impl<'a, R: BufRead> Segments for BufReadSegments<R> {
+    fn next(&mut self) -> io::Result<usize> {
         let result = read_segment(
             &mut self.source,
             &mut self.control_stream,
             &mut self.data_stream,
         );
         match result {
-            Ok(elements) => {
-                self.elements_left = elements;
-                Ok(())
-            }
+            Ok(elements) => Ok(elements),
             Err(e) => {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
-                    self.control_stream.clear();
-                    self.data_stream.clear();
-                    Ok(())
+                    Ok(0)
                 } else {
                     Err(e)
                 }
             }
         }
+    }
+
+    fn data_stream(&self) -> &[u8] {
+        &self.data_stream[..]
+    }
+
+    fn control_stream(&self) -> &[u8] {
+        &self.control_stream[..]
+    }
+}
+
+/// Stream VByte decoder
+///
+/// Initialized using two streams: control stream and data streams.
+/// At the moment all data needs to be buffered into memory.
+pub struct StreamVByteDecoder<S: Segments> {
+    control_stream_pos: usize,
+    data_stream_pos: usize,
+    elements_left: usize,
+    segments: S,
+}
+
+impl<'a, R: BufRead> StreamVByteDecoder<BufReadSegments<R>> {
+    pub fn new(source: R) -> io::Result<Self> {
+        let segments = BufReadSegments::new(source);
+        Ok(Self {
+            control_stream_pos: 0,
+            data_stream_pos: 0,
+            elements_left: 0,
+            segments,
+        })
+    }
+}
+
+impl<S: Segments> StreamVByteDecoder<S> {
+    #[inline(never)]
+    fn refill(&mut self) -> io::Result<usize> {
+        debug_assert!(
+            self.elements_left == 0,
+            "Should be 0, got: {}",
+            self.elements_left
+        );
+        let elements = self.segments.next()?;
+        if elements > 0 {
+            self.control_stream_pos = 0;
+            self.data_stream_pos = 0;
+            self.elements_left = elements;
+        }
+        Ok(elements)
     }
 }
 
@@ -125,21 +165,27 @@ fn read_segment(input: &mut impl BufRead, cs: &mut Vec<u8>, ds: &mut Vec<u8>) ->
     Ok(number_of_elements)
 }
 
-impl<R: BufRead> Decoder<u32> for StreamVByteDecoder<R> {
+impl<'a, S: Segments> Decoder<u32> for StreamVByteDecoder<S> {
     fn decode(&mut self, buffer: &mut [u32]) -> usize {
         assert!(buffer.len() % 4 == 0, "Buffer should be devisible by 4");
-        if self.control_stream_pos >= self.control_stream.len() {
-            self.refill().unwrap();
+        let control_stream_len = self.segments.control_stream().len();
+        if self.control_stream_pos >= control_stream_len {
+            if self.refill().unwrap() == 0 {
+                return 0;
+            }
         }
+
+        let control_stream = self.segments.control_stream();
+        let data_stream = self.segments.data_stream();
 
         let mut elements_decoded = 0;
         for chunk in buffer.chunks_exact(4) {
-            let Some(control_word) = self.control_stream.get(self.control_stream_pos) else {
+            let Some(control_word) = control_stream.get(self.control_stream_pos) else {
                 break;
             };
 
             let (ref mask, encoded_len) = MASKS[*control_word as usize];
-            let input = &self.data_stream[self.data_stream_pos];
+            let input = &data_stream[self.data_stream_pos];
             unsafe {
                 let mask = _mm_loadu_si128(mask as *const u32x4 as *const __m128i);
                 let input = _mm_loadu_si128(input as *const u8 as *const __m128i);
@@ -434,7 +480,7 @@ mod tests {
         input.resize(len, 0);
         rng.fill(&mut input[..]);
         let (_, _, encoded) = encode_values(&input);
-        let output = StreamVByteDecoder::new(encoded).to_vec();
+        let output = StreamVByteDecoder::new(encoded).unwrap().to_vec();
         assert_eq!(input.len(), output.len());
         assert_eq!(output, input);
     }
@@ -443,7 +489,7 @@ mod tests {
     fn check_decode() {
         let input = [1, 255, 1024, 2048, 0xFF000000];
         let (_, _, encoded) = encode_values(&input);
-        let output = StreamVByteDecoder::new(encoded).to_vec();
+        let output = StreamVByteDecoder::new(encoded).unwrap().to_vec();
         assert_eq!(output.len(), output.len());
         assert_eq!(output, input);
     }
