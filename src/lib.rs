@@ -66,7 +66,7 @@ impl<R> BufReadSegments<R> {
     }
 }
 
-impl<'a, R: BufRead> Segments for BufReadSegments<R> {
+impl<R: BufRead> Segments for BufReadSegments<R> {
     fn next(&mut self) -> io::Result<usize> {
         let result = read_segment(
             &mut self.source,
@@ -149,7 +149,7 @@ pub struct StreamVByteDecoder<S: Segments> {
     segments: S,
 }
 
-impl<'a, S: Segments> StreamVByteDecoder<S> {
+impl<S: Segments> StreamVByteDecoder<S> {
     pub fn new(segments: S) -> io::Result<Self> {
         Ok(Self {
             control_stream_pos: 0,
@@ -260,14 +260,12 @@ fn read_segment(input: &mut impl BufRead, cs: &mut Vec<u8>, ds: &mut Vec<u8>) ->
     Ok(header.count)
 }
 
-impl<'a, S: Segments> Decoder<u32> for StreamVByteDecoder<S> {
+impl<S: Segments> Decoder<u32> for StreamVByteDecoder<S> {
     fn decode(&mut self, buffer: &mut [u32]) -> usize {
         assert!(buffer.len() % 4 == 0, "Buffer should be devisible by 4");
         let control_stream_len = self.segments.control_stream().len();
-        if self.control_stream_pos >= control_stream_len {
-            if self.refill().unwrap() == 0 {
-                return 0;
-            }
+        if self.control_stream_pos >= control_stream_len && self.refill().unwrap() == 0 {
+            return 0;
         }
 
         let control_stream = self.segments.control_stream();
@@ -286,8 +284,8 @@ impl<'a, S: Segments> Decoder<u32> for StreamVByteDecoder<S> {
             self.data_stream_pos += encoded_len as usize;
         }
 
-        let mut iterations = buffer.len() / 4;
-        let mut elements_decoded = self.elements_left.min(4 * iterations);
+        let iterations = buffer.len() / 4;
+        let elements_decoded = self.elements_left.min(4 * iterations);
         self.elements_left -= elements_decoded;
         self.control_stream_pos += iterations;
         elements_decoded

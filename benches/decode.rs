@@ -1,9 +1,7 @@
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use rand::{thread_rng, Rng};
 use std::io::Cursor;
-use stream_decode::{
-    BufReadSegments, Decoder, MemorySegments, StreamVByteDecoder, StreamVByteEncoder,
-};
+use stream_decode::{Decoder, MemorySegments, StreamVByteDecoder, StreamVByteEncoder};
 
 fn criterion_benchmark(c: &mut Criterion) {
     let mut rng = thread_rng();
