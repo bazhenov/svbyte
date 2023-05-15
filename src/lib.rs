@@ -95,27 +95,46 @@ impl<'a, R: BufRead> Segments for BufReadSegments<R> {
 }
 
 /// [`Segments`] implementation with all segment data in memory
-struct MemorySegments {
-    data: Vec<u8>,
+pub struct MemorySegments<'a> {
+    data: &'a [u8],
+    control_stream: &'a [u8],
+    data_stream: &'a [u8],
 }
 
-impl MemorySegments {
-    fn new(data: Vec<u8>) -> Self {
-        Self { data }
+impl<'a> MemorySegments<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            control_stream: &data[0..0],
+            data_stream: &data[0..0],
+        }
     }
 }
 
-impl Segments for MemorySegments {
+impl<'a> Segments for MemorySegments<'a> {
     fn next(&mut self) -> io::Result<usize> {
-        todo!()
+        if self.data.is_empty() {
+            return Ok(0);
+        }
+
+        let segment = SegmentHeader::parse(self.data);
+        self.control_stream =
+            &self.data[SEGMENT_HEADER_LENGTH..SEGMENT_HEADER_LENGTH + segment.cs_length];
+        self.data_stream = &self.data[SEGMENT_HEADER_LENGTH + segment.cs_length
+            ..SEGMENT_HEADER_LENGTH + segment.cs_length + segment.ds_length];
+        self.data = &self.data[SEGMENT_HEADER_LENGTH + segment.cs_length + segment.ds_length..];
+
+        Ok(segment.count)
     }
 
+    #[inline]
     fn data_stream(&self) -> &[u8] {
-        todo!()
+        self.data_stream
     }
 
+    #[inline]
     fn control_stream(&self) -> &[u8] {
-        todo!()
+        self.control_stream
     }
 }
 
@@ -130,9 +149,8 @@ pub struct StreamVByteDecoder<S: Segments> {
     segments: S,
 }
 
-impl<'a, R: BufRead> StreamVByteDecoder<BufReadSegments<R>> {
-    pub fn new(source: R) -> io::Result<Self> {
-        let segments = BufReadSegments::new(source);
+impl<'a, S: Segments> StreamVByteDecoder<S> {
+    pub fn new(segments: S) -> io::Result<Self> {
         Ok(Self {
             control_stream_pos: 0,
             data_stream_pos: 0,
@@ -255,12 +273,8 @@ impl<'a, S: Segments> Decoder<u32> for StreamVByteDecoder<S> {
         let control_stream = self.segments.control_stream();
         let data_stream = self.segments.data_stream();
 
-        let mut elements_decoded = 0;
-        for chunk in buffer.chunks_exact(4) {
-            let Some(control_word) = control_stream.get(self.control_stream_pos) else {
-                break;
-            };
-
+        let control_words = control_stream[self.control_stream_pos..].iter();
+        for (chunk, control_word) in buffer.chunks_exact(4).zip(control_words) {
             let (ref mask, encoded_len) = MASKS[*control_word as usize];
             let input = &data_stream[self.data_stream_pos];
             unsafe {
@@ -269,13 +283,13 @@ impl<'a, S: Segments> Decoder<u32> for StreamVByteDecoder<S> {
                 let answer = _mm_shuffle_epi8(input, mask);
                 _mm_storeu_si128(chunk.as_ptr() as *mut __m128i, answer);
             }
-            elements_decoded += 4;
             self.data_stream_pos += encoded_len as usize;
-            self.control_stream_pos += 1;
         }
 
-        elements_decoded = elements_decoded.min(self.elements_left);
+        let mut iterations = buffer.len() / 4;
+        let mut elements_decoded = self.elements_left.min(4 * iterations);
         self.elements_left -= elements_decoded;
+        self.control_stream_pos += iterations;
         elements_decoded
     }
 }
@@ -550,7 +564,9 @@ mod tests {
         input.resize(len, 0);
         rng.fill(&mut input[..]);
         let (_, _, encoded) = encode_values(&input);
-        let output = StreamVByteDecoder::new(encoded).unwrap().to_vec();
+        let output = StreamVByteDecoder::new(MemorySegments::new(&encoded.into_inner()))
+            .unwrap()
+            .to_vec();
         assert_eq!(input.len(), output.len());
         assert_eq!(output, input);
     }
@@ -559,7 +575,9 @@ mod tests {
     fn check_decode() {
         let input = [1, 255, 1024, 2048, 0xFF000000];
         let (_, _, encoded) = encode_values(&input);
-        let output = StreamVByteDecoder::new(encoded).unwrap().to_vec();
+        let output = StreamVByteDecoder::new(MemorySegments::new(&encoded.into_inner()))
+            .unwrap()
+            .to_vec();
         assert_eq!(output.len(), output.len());
         assert_eq!(output, input);
     }
@@ -611,7 +629,7 @@ mod tests {
     }
 
     /// Creates and returns control and data stream for a given slice of numbers
-    pub fn encode_values(input: &[u32]) -> (Vec<u8>, Vec<u8>, impl BufRead) {
+    pub fn encode_values(input: &[u32]) -> (Vec<u8>, Vec<u8>, Cursor<Vec<u8>>) {
         let mut encoder = StreamVByteEncoder::new(Cursor::new(vec![]));
         encoder.encode(input).unwrap();
         let mut source = encoder.finish().unwrap();
