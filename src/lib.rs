@@ -34,18 +34,22 @@ const MASKS: [(u32x4, u8); 256] = u32_shuffle_masks();
 
 const SEGMENT_MAGIC: u16 = 0x0B0D;
 
-/// Provides asses to control and data streams of a segment
+/// Provides asses to control and data streams of a segments
+///
+/// Each segment contains elements (integers) in encoded format. Each [`next`] method call
+/// moves this objects to the next segment and return number of elements in that segment.
 pub trait Segments {
-    /// Returns:
-    ///
-    /// 1. number of encoded elements in the segment
-    /// 2. control stream of a segment
-    /// 3. data stream of a segment
+    /// Moves to the next segment and return number of elements encoded or zero
     fn next(&mut self) -> io::Result<usize>;
+
+    /// Returns bytes of the current segment control stream
     fn data_stream(&self) -> &[u8];
+
+    /// Returns bytes of the current segment data stream
     fn control_stream(&self) -> &[u8];
 }
 
+/// [`Segments`] implementation which reads segment from underlying [`BufRead`]
 pub struct BufReadSegments<R> {
     source: R,
     control_stream: Vec<u8>,
@@ -90,6 +94,31 @@ impl<'a, R: BufRead> Segments for BufReadSegments<R> {
     }
 }
 
+/// [`Segments`] implementation with all segment data in memory
+struct MemorySegments {
+    data: Vec<u8>,
+}
+
+impl MemorySegments {
+    fn new(data: Vec<u8>) -> Self {
+        Self { data }
+    }
+}
+
+impl Segments for MemorySegments {
+    fn next(&mut self) -> io::Result<usize> {
+        todo!()
+    }
+
+    fn data_stream(&self) -> &[u8] {
+        todo!()
+    }
+
+    fn control_stream(&self) -> &[u8] {
+        todo!()
+    }
+}
+
 /// Stream VByte decoder
 ///
 /// Initialized using two streams: control stream and data streams.
@@ -131,38 +160,86 @@ impl<S: Segments> StreamVByteDecoder<S> {
     }
 }
 
+const SEGMENT_HEADER_LENGTH: usize = 14;
+
+#[derive(Debug, PartialEq)]
+struct SegmentHeader {
+    count: usize,
+    cs_length: usize,
+    ds_length: usize,
+}
+
+impl SegmentHeader {
+    fn new(count: usize, cs_size: usize, ds_size: usize) -> Self {
+        Self {
+            count,
+            cs_length: cs_size,
+            ds_length: ds_size,
+        }
+    }
+
+    fn parse(input: &[u8]) -> Self {
+        assert!(
+            input.len() >= SEGMENT_HEADER_LENGTH,
+            "Expected slice of len >={}, got: {}",
+            SEGMENT_HEADER_LENGTH,
+            input.len()
+        );
+        let input = &input[..SEGMENT_HEADER_LENGTH];
+
+        let magic = u16::from_be_bytes(input[0..2].try_into().unwrap());
+        let count = u32::from_be_bytes(input[2..6].try_into().unwrap()) as usize;
+        let cs_length = u32::from_be_bytes(input[6..10].try_into().unwrap()) as usize;
+        let ds_length = u32::from_be_bytes(input[10..14].try_into().unwrap()) as usize;
+
+        assert!(
+            magic == SEGMENT_MAGIC,
+            "Expected magic: {}, got: {}",
+            SEGMENT_MAGIC,
+            magic,
+        );
+
+        Self {
+            count,
+            cs_length,
+            ds_length,
+        }
+    }
+
+    fn write(&self, out: &mut dyn Write) -> io::Result<()> {
+        out.write_all(&SEGMENT_MAGIC.to_be_bytes())?;
+
+        debug_assert!(self.count <= u32::MAX as usize);
+        let number_of_elements = (self.count as u32).to_be_bytes();
+        out.write_all(&number_of_elements)?;
+
+        debug_assert!(self.cs_length <= u32::MAX as usize);
+        let cs_len = (self.cs_length as u32).to_be_bytes();
+        out.write_all(&cs_len)?;
+
+        debug_assert!(self.ds_length <= u32::MAX as usize);
+        let ds_len = (self.ds_length as u32).to_be_bytes();
+        out.write_all(&ds_len)?;
+
+        Ok(())
+    }
+}
+
 /// Reads the segment, checks segment header and copies streams into corresponding buffers
 ///
 /// Returns the number of elements encoded in the segment
 fn read_segment(input: &mut impl BufRead, cs: &mut Vec<u8>, ds: &mut Vec<u8>) -> io::Result<usize> {
-    let mut buf = [0u8; 2];
+    let mut buf = [0u8; SEGMENT_HEADER_LENGTH];
     input.read_exact(&mut buf)?;
-    let magic = u16::from_be_bytes(buf);
+    let header = SegmentHeader::parse(&buf);
 
-    assert!(
-        magic == SEGMENT_MAGIC,
-        "Expected magic: {}, got: {}",
-        SEGMENT_MAGIC,
-        magic,
-    );
+    cs.resize(header.cs_length, 0);
+    input.read_exact(&mut cs[..header.cs_length])?;
 
-    let mut buf = [0u8; 4];
-    input.read_exact(&mut buf)?;
-    let number_of_elements = u32::from_be_bytes(buf) as usize;
+    ds.resize(header.ds_length, 0);
+    input.read_exact(&mut ds[..header.ds_length])?;
 
-    input.read_exact(&mut buf)?;
-    let cs_length = u32::from_be_bytes(buf) as usize;
-
-    input.read_exact(&mut buf)?;
-    let ds_length = u32::from_be_bytes(buf) as usize;
-
-    cs.resize(cs_length, 0);
-    input.read_exact(&mut cs[..cs_length])?;
-
-    ds.resize(ds_length, 0);
-    input.read_exact(&mut ds[..ds_length])?;
-
-    Ok(number_of_elements)
+    Ok(header.count)
 }
 
 impl<'a, S: Segments> Decoder<u32> for StreamVByteDecoder<S> {
@@ -376,19 +453,12 @@ impl<W: Write> StreamVByteEncoder<W> {
             *control_word <<= 2 * (4 - tail);
         }
 
-        self.output.write_all(&SEGMENT_MAGIC.to_be_bytes())?;
-
-        debug_assert!(self.written <= u32::MAX as usize);
-        let number_of_elements = (self.written as u32).to_be_bytes();
-        self.output.write_all(&number_of_elements)?;
-
-        debug_assert!(self.control_stream.len() <= u32::MAX as usize);
-        let cs_len = (self.control_stream.len() as u32).to_be_bytes();
-        self.output.write_all(&cs_len)?;
-
-        debug_assert!(self.data_stream.len() <= u32::MAX as usize);
-        let ds_len = (self.data_stream.len() as u32).to_be_bytes();
-        self.output.write_all(&ds_len)?;
+        let header = SegmentHeader::new(
+            self.written,
+            self.control_stream.len(),
+            self.data_stream.len(),
+        );
+        header.write(&mut self.output)?;
 
         self.output.write_all(&self.control_stream)?;
         self.output.write_all(&self.data_stream)?;
@@ -528,6 +598,16 @@ mod tests {
             masks[0b_11_10_01_00],
             ([0x00010203, 0x80_040506, 0x8080_0708, 0x808080_09], 10)
         );
+    }
+
+    #[test]
+    fn check_header_format() {
+        let expected = SegmentHeader::new(3, 1, 2);
+        let mut out = vec![];
+
+        expected.write(&mut out).unwrap();
+        let header = SegmentHeader::parse(&out);
+        assert_eq!(header, expected);
     }
 
     /// Creates and returns control and data stream for a given slice of numbers
