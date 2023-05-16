@@ -269,24 +269,39 @@ impl<S: Segments> Decoder<u32> for StreamVByteDecoder<S> {
         }
 
         let mut control_stream = &self.segments.control_stream()[self.control_stream_pos..];
-        let mut data_stream = &self.segments.data_stream()[self.data_stream_pos..];
-
+        let mut data_stream = self.segments.data_stream()[self.data_stream_pos..].as_ptr();
         let mut decoded = 0;
         let mut data_stream_offset = 0;
 
         // 8 wide decode
-        const UNROLL_FACTOR: usize = 8;
+        const UNROLL_FACTOR: usize = 4;
         while control_stream.len() >= UNROLL_FACTOR && buffer.len() >= UNROLL_FACTOR * 4 {
-            let chunk = buffer[..UNROLL_FACTOR * 4].chunks_exact_mut(4);
-            let cw = control_stream[..UNROLL_FACTOR].iter();
+            let chunk = &mut buffer[..UNROLL_FACTOR * 4];
+            let mut cw = control_stream[..UNROLL_FACTOR].as_ptr();
 
-            for (chunk, control_word) in chunk.zip(cw) {
-                let (ref mask, encoded_len) = MASKS[*control_word as usize];
-                let input = data_stream.as_ptr();
-                simd_decode(input, chunk, mask);
-                data_stream = &data_stream[encoded_len as usize..];
-                data_stream_offset += encoded_len as usize;
-            }
+            let (ref mask, encoded_len) = MASKS[unsafe { *cw } as usize];
+            simd_decode(data_stream, unsafe { chunk.get_unchecked_mut(0) }, mask);
+            cw = cw.wrapping_add(1);
+            data_stream = data_stream.wrapping_add(encoded_len as usize);
+            data_stream_offset += encoded_len as usize;
+
+            let (ref mask, encoded_len) = MASKS[unsafe { *cw } as usize];
+            simd_decode(data_stream, unsafe { chunk.get_unchecked_mut(4) }, mask);
+            cw = cw.wrapping_add(1);
+            data_stream = data_stream.wrapping_add(encoded_len as usize);
+            data_stream_offset += encoded_len as usize;
+
+            let (ref mask, encoded_len) = MASKS[unsafe { *cw } as usize];
+            simd_decode(data_stream, unsafe { chunk.get_unchecked_mut(8) }, mask);
+            cw = cw.wrapping_add(1);
+            data_stream = data_stream.wrapping_add(encoded_len as usize);
+            data_stream_offset += encoded_len as usize;
+
+            let (ref mask, encoded_len) = MASKS[unsafe { *cw } as usize];
+            simd_decode(data_stream, unsafe { chunk.get_unchecked_mut(12) }, mask);
+            cw = cw.wrapping_add(1);
+            data_stream = data_stream.wrapping_add(encoded_len as usize);
+            data_stream_offset += encoded_len as usize;
 
             decoded += UNROLL_FACTOR * 4;
             control_stream = &control_stream[UNROLL_FACTOR..];
@@ -300,9 +315,9 @@ impl<S: Segments> Decoder<u32> for StreamVByteDecoder<S> {
 
             for (chunk, control_word) in chunk.zip(cw) {
                 let (ref mask, encoded_len) = MASKS[*control_word as usize];
-                let input = data_stream.as_ptr();
-                simd_decode(input, chunk, mask);
-                data_stream = &data_stream[encoded_len as usize..];
+                // let input = data_stream.as_ptr();
+                simd_decode(data_stream, chunk.as_mut_ptr(), mask);
+                data_stream = data_stream.wrapping_add(encoded_len as usize);
                 data_stream_offset += encoded_len as usize;
                 decoded += 4;
             }
@@ -317,12 +332,12 @@ impl<S: Segments> Decoder<u32> for StreamVByteDecoder<S> {
 }
 
 #[inline]
-fn simd_decode(input: *const u8, output: &mut [u32], mask: &[u32]) {
+fn simd_decode(input: *const u8, output: *mut u32, mask: &[u32]) {
     unsafe {
         let mask = _mm_loadu_si128(mask.as_ptr() as *const __m128i);
         let input = _mm_loadu_si128(input as *const __m128i);
         let answer = _mm_shuffle_epi8(input, mask);
-        _mm_storeu_si128(output.as_ptr() as *mut __m128i, answer);
+        _mm_storeu_si128(output as *mut __m128i, answer);
     }
 }
 
