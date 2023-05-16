@@ -1,19 +1,19 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use rand::{thread_rng, Rng, RngCore};
 use std::io::Cursor;
-use stream_decode::{Decoder, MemorySegments, StreamVByteDecoder, StreamVByteEncoder};
+use stream_decode::{DecodeCursor, Decoder, EncodeCursor, MemorySegments};
 
 fn criterion_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode");
     let size = 100_000;
     let input = generate_random_data(size);
-    let mut encoder = StreamVByteEncoder::new(Cursor::new(vec![]));
+    let mut encoder = EncodeCursor::new(Cursor::new(vec![]));
     encoder.encode(&input).unwrap();
     let data = encoder.finish().unwrap().into_inner();
     group.throughput(Throughput::Elements(size as u64));
     group.bench_function("u32", |b| {
         b.iter_batched(
-            || StreamVByteDecoder::new(MemorySegments::new(&data)).unwrap(),
+            || DecodeCursor::new(MemorySegments::new(&data)).unwrap(),
             |mut d| {
                 let mut buf = [0; 256];
                 while d.decode(&mut buf) > 0 {}

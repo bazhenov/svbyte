@@ -142,14 +142,14 @@ impl<'a> Segments for MemorySegments<'a> {
 ///
 /// Initialized using two streams: control stream and data streams.
 /// At the moment all data needs to be buffered into memory.
-pub struct StreamVByteDecoder<S: Segments> {
+pub struct DecodeCursor<S: Segments> {
     control_stream_pos: usize,
     data_stream_pos: usize,
     elements_left: usize,
     segments: S,
 }
 
-impl<S: Segments> StreamVByteDecoder<S> {
+impl<S: Segments> DecodeCursor<S> {
     pub fn new(segments: S) -> io::Result<Self> {
         Ok(Self {
             control_stream_pos: 0,
@@ -158,9 +158,7 @@ impl<S: Segments> StreamVByteDecoder<S> {
             segments,
         })
     }
-}
 
-impl<S: Segments> StreamVByteDecoder<S> {
     #[inline(never)]
     fn refill(&mut self) -> io::Result<usize> {
         debug_assert!(
@@ -260,84 +258,86 @@ fn read_segment(input: &mut impl BufRead, cs: &mut Vec<u8>, ds: &mut Vec<u8>) ->
     Ok(header.count)
 }
 
-impl<S: Segments> Decoder<u32> for StreamVByteDecoder<S> {
-    fn decode(&mut self, mut buffer: &mut [u32]) -> usize {
-        assert!(buffer.len() % 4 == 0, "Buffer should be divisible by 4");
+impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
+    fn decode(&mut self, buffer: &mut [u32]) -> usize {
+        assert!(
+            buffer.len() >= 4,
+            "Buffer should be at least 4 elements long"
+        );
         let control_stream_len = self.segments.control_stream().len();
         if self.control_stream_pos >= control_stream_len && self.refill().unwrap() == 0 {
             return 0;
         }
 
-        let mut control_stream = &self.segments.control_stream()[self.control_stream_pos..];
+        let iterations = buffer.len() / 4;
+        let iterations =
+            iterations.min(self.segments.control_stream()[self.control_stream_pos..].len());
+        let mut iterations_left = iterations;
+
         let mut data_stream = self.segments.data_stream()[self.data_stream_pos..].as_ptr();
-        let mut decoded = 0;
         let mut data_stream_offset = 0;
 
+        let mut output = buffer.as_mut_ptr();
+        let mut control_word = self.segments.control_stream()[self.control_stream_pos..].as_ptr();
+
         // 8 wide decode
-        const UNROLL_FACTOR: usize = 4;
-        while control_stream.len() >= UNROLL_FACTOR && buffer.len() >= UNROLL_FACTOR * 4 {
-            let chunk = &mut buffer[..UNROLL_FACTOR * 4];
-            let mut cw = control_stream[..UNROLL_FACTOR].as_ptr();
+        const UNROLL_FACTOR: usize = 8;
+        while iterations_left >= UNROLL_FACTOR {
+            for _ in 0..UNROLL_FACTOR {
+                let encoded_len = simd_decode(data_stream, output as *mut u32x4, control_word);
+                control_word = control_word.wrapping_add(1);
+                output = output.wrapping_add(4);
+                data_stream = data_stream.wrapping_add(encoded_len as usize);
+                data_stream_offset += encoded_len as usize;
+            }
 
-            let (ref mask, encoded_len) = MASKS[unsafe { *cw } as usize];
-            simd_decode(data_stream, unsafe { chunk.get_unchecked_mut(0) }, mask);
-            cw = cw.wrapping_add(1);
-            data_stream = data_stream.wrapping_add(encoded_len as usize);
-            data_stream_offset += encoded_len as usize;
-
-            let (ref mask, encoded_len) = MASKS[unsafe { *cw } as usize];
-            simd_decode(data_stream, unsafe { chunk.get_unchecked_mut(4) }, mask);
-            cw = cw.wrapping_add(1);
-            data_stream = data_stream.wrapping_add(encoded_len as usize);
-            data_stream_offset += encoded_len as usize;
-
-            let (ref mask, encoded_len) = MASKS[unsafe { *cw } as usize];
-            simd_decode(data_stream, unsafe { chunk.get_unchecked_mut(8) }, mask);
-            cw = cw.wrapping_add(1);
-            data_stream = data_stream.wrapping_add(encoded_len as usize);
-            data_stream_offset += encoded_len as usize;
-
-            let (ref mask, encoded_len) = MASKS[unsafe { *cw } as usize];
-            simd_decode(data_stream, unsafe { chunk.get_unchecked_mut(12) }, mask);
-            cw = cw.wrapping_add(1);
-            data_stream = data_stream.wrapping_add(encoded_len as usize);
-            data_stream_offset += encoded_len as usize;
-
-            decoded += UNROLL_FACTOR * 4;
-            control_stream = &control_stream[UNROLL_FACTOR..];
-            buffer = &mut buffer[UNROLL_FACTOR * 4..];
+            iterations_left -= UNROLL_FACTOR;
         }
 
         // Tail decode
-        {
-            let chunk = buffer.chunks_exact_mut(4);
-            let cw = control_stream.iter();
-
-            for (chunk, control_word) in chunk.zip(cw) {
-                let (ref mask, encoded_len) = MASKS[*control_word as usize];
-                // let input = data_stream.as_ptr();
-                simd_decode(data_stream, chunk.as_mut_ptr(), mask);
-                data_stream = data_stream.wrapping_add(encoded_len as usize);
-                data_stream_offset += encoded_len as usize;
-                decoded += 4;
-            }
+        while iterations_left > 0 {
+            let encoded_len = simd_decode(data_stream, output as *mut u32x4, control_word);
+            output = output.wrapping_add(4);
+            control_word = control_word.wrapping_add(1);
+            data_stream = data_stream.wrapping_add(encoded_len as usize);
+            data_stream_offset += encoded_len as usize;
+            iterations_left -= 1;
         }
 
         self.data_stream_pos += data_stream_offset;
-        self.control_stream_pos += decoded / 4;
-        decoded = decoded.min(self.elements_left);
+        self.control_stream_pos += iterations;
+        let decoded = (iterations * 4).min(self.elements_left);
         self.elements_left -= decoded;
         decoded
     }
 }
 
+/// Decoding SIMD kernel using SSE intrinsics
+///
+/// Types of this function tries to implement safety guardrails as much as possible. Namely:
+/// `output` - is a reference to the buffer of 4 u32 values;
+/// `input` - is a reference to u8 array of unspecified length (`control_word` speciefies how much will be decoded);
+//
+/// Technically the encoded length can be calculated from control word directly using horizontal 2-bit sum
+/// ```rust,ignore
+/// let result = *control_word;
+/// let result = ((result & 0b11001100) >> 2) + (result & 0b00110011);
+/// let result = (result >> 4) + (result & 0b1111) + 4;
+/// ```
+/// Unfortunatley, this approach is slower then memoized length. There is a mention of this approach can be faster
+/// when using u32 control words, which implies decoding a batch of size 16[^1].
+///
+/// [^1]: [Bit hacking versus memoization: a Stream VByte example](https://lemire.me/blog/2017/11/28/bit-hacking-versus-memoization-a-stream-vbyte-example/)
 #[inline]
-fn simd_decode(input: *const u8, output: *mut u32, mask: &[u32]) {
+fn simd_decode(input: *const u8, output: *mut u32x4, control_word: *const u8) -> u8 {
     unsafe {
+        let (ref mask, encoded_len) = MASKS[*control_word as usize];
         let mask = _mm_loadu_si128(mask.as_ptr() as *const __m128i);
         let input = _mm_loadu_si128(input as *const __m128i);
         let answer = _mm_shuffle_epi8(input, mask);
-        _mm_storeu_si128(output as *mut __m128i, answer);
+        _mm_storeu_si128(output.cast(), answer);
+
+        encoded_len
     }
 }
 
@@ -447,14 +447,14 @@ Data format follows this structure:
 Segment header (`MAGIC`, `CS SIZE`, `DS SIZE`) is enough to calculate the whole segment size.
 Segments follows each other until EOF of a stream reached.
 */
-pub struct StreamVByteEncoder<W> {
+pub struct EncodeCursor<W> {
     data_stream: Vec<u8>,
     control_stream: Vec<u8>,
     output: Box<W>,
     written: usize,
 }
 
-impl<W: Write> StreamVByteEncoder<W> {
+impl<W: Write> EncodeCursor<W> {
     pub fn new(output: W) -> Self {
         Self {
             data_stream: vec![],
@@ -611,11 +611,10 @@ mod tests {
         }
     }
 
-    // TODO balanced number generator 1-4 bytes long
     fn check_encode_decode_cycle(rng: &mut ThreadRng, len: usize) {
         let input: Vec<u32> = generate_random_data(rng, len);
         let (_, _, encoded) = encode_values(&input);
-        let output = StreamVByteDecoder::new(MemorySegments::new(&encoded.into_inner()))
+        let output = DecodeCursor::new(MemorySegments::new(&encoded.into_inner()))
             .unwrap()
             .to_vec();
         assert_eq!(input.len(), output.len());
@@ -633,7 +632,7 @@ mod tests {
     fn check_decode() {
         let input = [1, 255, 1024, 2048, 0xFF000000];
         let (_, _, encoded) = encode_values(&input);
-        let output = StreamVByteDecoder::new(MemorySegments::new(&encoded.into_inner()))
+        let output = DecodeCursor::new(MemorySegments::new(&encoded.into_inner()))
             .unwrap()
             .to_vec();
         assert_eq!(output.len(), output.len());
@@ -688,7 +687,7 @@ mod tests {
 
     /// Creates and returns control and data stream for a given slice of numbers
     pub fn encode_values(input: &[u32]) -> (Vec<u8>, Vec<u8>, Cursor<Vec<u8>>) {
-        let mut encoder = StreamVByteEncoder::new(Cursor::new(vec![]));
+        let mut encoder = EncodeCursor::new(Cursor::new(vec![]));
         encoder.encode(input).unwrap();
         let mut source = encoder.finish().unwrap();
         let mut cs = vec![];
@@ -711,17 +710,18 @@ mod tests {
         ]
     }
 
+    /// Generates "weighed" dataset fortesting purposes
+    ///
+    /// "Weighted" basically means that there is equal number of elements (in probabilistic terms)
+    /// with different length in varint encoding.
     fn generate_random_data(rng: &mut ThreadRng, size: usize) -> Vec<u32> {
         let mut input = vec![];
-        input.resize(size, 0);
-        for i in input.iter_mut() {
-            *i = match rng.gen_range(1..=4) {
-                1 => rng.next_u32() % 0xFF,
-                2 => rng.next_u32() % 0xFFFF,
-                3 => rng.next_u32() % 0xFFFFFF,
-                _ => rng.next_u32(),
-            }
-        }
+        input.resize_with(size, || match rng.gen_range(1..=4) {
+            1 => rng.next_u32() % (0xFF + 1),
+            2 => rng.next_u32() % (0xFFFF + 1),
+            3 => rng.next_u32() % (0xFFFFFF + 1),
+            _ => rng.next_u32(),
+        });
         input
     }
 }
