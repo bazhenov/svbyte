@@ -261,42 +261,66 @@ fn read_segment(input: &mut impl BufRead, cs: &mut Vec<u8>, ds: &mut Vec<u8>) ->
 }
 
 impl<S: Segments> Decoder<u32> for StreamVByteDecoder<S> {
-    fn decode(&mut self, buffer: &mut [u32]) -> usize {
-        assert!(buffer.len() % 32 == 0, "Buffer should be devisible by 32");
+    fn decode(&mut self, mut buffer: &mut [u32]) -> usize {
+        assert!(buffer.len() % 4 == 0, "Buffer should be devisible by 32");
         let control_stream_len = self.segments.control_stream().len();
         if self.control_stream_pos >= control_stream_len && self.refill().unwrap() == 0 {
             return 0;
         }
 
-        let control_stream = self.segments.control_stream();
+        let buffer_len = buffer.len();
+
+        let mut control_stream = &self.segments.control_stream()[self.control_stream_pos..];
         let data_stream = self.segments.data_stream();
 
-        let control_words = control_stream[self.control_stream_pos..].chunks_exact(8);
-        let buffers = buffer.chunks_exact(32);
-        // dbg!(&control_stream[self.control_stream_pos..].len());
-        // dbg!(control_words.len());
-        for (chunks, control_words) in buffers.zip(control_words) {
-            let chunk = chunks.chunks_exact(4);
-            let cw = control_words.iter();
+        let elements_before = self.elements_left;
+        // 8 wide decode
+        while control_stream.len() >= 8 && buffer.len() >= 32 {
+            let chunk = buffer[..32].chunks_exact_mut(4);
+            let cw = control_stream[..8].iter();
 
             for (chunk, control_word) in chunk.zip(cw) {
                 let (ref mask, encoded_len) = MASKS[*control_word as usize];
                 let input = &data_stream[self.data_stream_pos];
-                unsafe {
-                    let mask = _mm_loadu_si128(mask as *const u32x4 as *const __m128i);
-                    let input = _mm_loadu_si128(input as *const u8 as *const __m128i);
-                    let answer = _mm_shuffle_epi8(input, mask);
-                    _mm_storeu_si128(chunk.as_ptr() as *mut __m128i, answer);
-                }
+                simd_decode(input, chunk, mask);
                 self.data_stream_pos += encoded_len as usize;
             }
+
+            self.control_stream_pos += 8;
+            self.elements_left -= self.elements_left.min(32);
+            control_stream = &control_stream[8..];
+            buffer = &mut buffer[32..];
         }
 
-        let iterations = buffer.len() / 4;
-        let elements_decoded = self.elements_left.min(buffer.len());
-        self.elements_left -= elements_decoded;
-        self.control_stream_pos += iterations;
-        elements_decoded
+        // Tail decode
+        {
+            let chunk = buffer.chunks_exact_mut(4);
+            let cw = control_stream.iter();
+
+            for (chunk, control_word) in chunk.zip(cw) {
+                let (ref mask, encoded_len) = MASKS[*control_word as usize];
+                let input = &data_stream[self.data_stream_pos];
+                simd_decode(input, chunk, mask);
+                self.data_stream_pos += encoded_len as usize;
+                self.control_stream_pos += 1;
+                self.elements_left -= self.elements_left.min(4);
+            }
+
+            // control_stream = &control_stream[8..];
+            // buffer = &mut buffer[32..];
+        }
+
+        elements_before - self.elements_left
+    }
+}
+
+#[inline]
+fn simd_decode(input: &u8, output: &mut [u32], mask: &[u32]) {
+    unsafe {
+        let mask = _mm_loadu_si128(mask.as_ptr() as *const __m128i);
+        let input = _mm_loadu_si128(input as *const u8 as *const __m128i);
+        let answer = _mm_shuffle_epi8(input, mask);
+        _mm_storeu_si128(output.as_ptr() as *mut __m128i, answer);
     }
 }
 
@@ -454,7 +478,7 @@ impl<W: Write> StreamVByteEncoder<W> {
             + 4 // control stream size
             + 4 // data stream size
             + self.data_stream.len() + self.control_stream.len();
-        if segment_size >= MAX_SEGMENT_SIZE && self.written % 32 == 0 {
+        if segment_size >= MAX_SEGMENT_SIZE {
             self.write_segment()?;
 
             self.written = 0;
@@ -508,7 +532,7 @@ pub trait Decoder<T: Default + Copy> {
     where
         Self: Sized,
     {
-        let mut buffer = [Default::default(); 32];
+        let mut buffer = [Default::default(); 128];
         let mut result = vec![];
         let mut len = self.decode(&mut buffer);
         while len > 0 {
@@ -551,8 +575,7 @@ mod tests {
     fn check_small_functional_encode_decode() {
         let mut rng = thread_rng();
         for _ in 0..1000 {
-            // TODO decoding variable length arrays
-            let len = 32 * rng.gen_range(1..5);
+            let len = rng.gen_range(1..20);
             check_encode_decode_cycle(&mut rng, len);
         }
     }
@@ -561,12 +584,12 @@ mod tests {
     fn check_large_functional_encode_decode() {
         let mut rng = thread_rng();
         for _ in 0..10 {
-            // TODO decoding variable length arrays
-            let len = 32 * rng.gen_range(1000..2000);
+            let len = rng.gen_range(10000..20000);
             check_encode_decode_cycle(&mut rng, len);
         }
     }
 
+    // TODO balanced number generator 1-4 bytes long
     fn check_encode_decode_cycle(rng: &mut ThreadRng, len: usize) {
         let mut input: Vec<u32> = vec![];
         input.resize(len, 0);
