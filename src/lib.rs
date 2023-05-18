@@ -259,14 +259,14 @@ fn read_segment(input: &mut impl BufRead, cs: &mut Vec<u8>, ds: &mut Vec<u8>) ->
 }
 
 impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
-    fn decode(&mut self, buffer: &mut [u32]) -> usize {
+    fn decode(&mut self, buffer: &mut [u32]) -> io::Result<usize> {
         assert!(
             buffer.len() >= 4,
             "Buffer should be at least 4 elements long"
         );
         let control_stream_len = self.segments.control_stream().len();
-        if self.control_stream_pos >= control_stream_len && self.refill().unwrap() == 0 {
-            return 0;
+        if self.control_stream_pos >= control_stream_len && self.refill()? == 0 {
+            return Ok(0);
         }
 
         let iterations = buffer.len() / 4;
@@ -308,7 +308,7 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
         self.control_stream_pos += iterations;
         let decoded = (iterations * 4).min(self.elements_left);
         self.elements_left -= decoded;
-        decoded
+        Ok(decoded)
     }
 }
 
@@ -547,20 +547,20 @@ pub trait Decoder<T: Default + Copy> {
     /// Decodes next elements into buffer and returns the number of decoded elements, or zero if and end of the
     /// stream is reached. There is no guarantee about buffer element past the return value. They might be
     /// left unchanged or zeroed out by this method.
-    fn decode(&mut self, buffer: &mut [T]) -> usize;
+    fn decode(&mut self, buffer: &mut [T]) -> io::Result<usize>;
 
-    fn to_vec(mut self) -> Vec<T>
+    fn to_vec(mut self) -> io::Result<Vec<T>>
     where
         Self: Sized,
     {
         let mut buffer = [Default::default(); 128];
         let mut result = vec![];
-        let mut len = self.decode(&mut buffer);
+        let mut len = self.decode(&mut buffer)?;
         while len > 0 {
             result.extend(&buffer[..len]);
-            len = self.decode(&mut buffer);
+            len = self.decode(&mut buffer)?;
         }
-        result
+        Ok(result)
     }
 }
 
@@ -616,7 +616,8 @@ mod tests {
         let (_, _, encoded) = encode_values(&input);
         let output = DecodeCursor::new(MemorySegments::new(&encoded.into_inner()))
             .unwrap()
-            .to_vec();
+            .to_vec()
+            .unwrap();
         assert_eq!(input.len(), output.len());
         let chunk_size = 4;
         for (i, (input, output)) in input
@@ -634,7 +635,8 @@ mod tests {
         let (_, _, encoded) = encode_values(&input);
         let output = DecodeCursor::new(MemorySegments::new(&encoded.into_inner()))
             .unwrap()
-            .to_vec();
+            .to_vec()
+            .unwrap();
         assert_eq!(output.len(), output.len());
         assert_eq!(output, input);
     }

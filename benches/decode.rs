@@ -16,7 +16,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             || DecodeCursor::new(MemorySegments::new(&data)).unwrap(),
             |mut d| {
                 let mut buf = [0; 256];
-                while d.decode(&mut buf) > 0 {}
+                while d.decode(&mut buf).unwrap() > 0 {}
             },
             BatchSize::SmallInput,
         )
