@@ -14,6 +14,10 @@ Stream VByte working using two data streams: control stream and data stream. Con
 byte each). Each control word describe length of 4 numbers in the data stream (2 bits per number, `00` - length 1,
 `01` - length 2 and so on).
 
+This decoder is able to achive 5.2 billions of `u32` numbers from main memory to L1 cache using single thread on a Intel Core i7-1068NG7 CPU @ 2.30GHz which is equivalent of 20.8GB of uncompressed u32 per second.
+
+## Links
+
 - [Decoding billions of integers per second through vectorization][pub] by Daniel Lemire and Leonid Boytsov.
 - [Stream VByte: breaking new speed records for integer compression][blog-post] by Daniel Lemire
 
