@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File},
+    fs::File,
     io::{self, BufReader, BufWriter},
     time::Instant,
 };
@@ -12,7 +12,7 @@ fn main() -> io::Result<()> {
     let start = Instant::now();
     let elements = 1_000_000;
     for i in 1..=elements {
-        encoder.encode(&[i]);
+        encoder.encode(&[i])?;
     }
     println!(
         "Encoded {} elements in {}ms",
@@ -21,7 +21,6 @@ fn main() -> io::Result<()> {
     );
 
     encoder.finish()?;
-    let metadata = fs::metadata(file_name)?;
 
     let segments = BufReadSegments::new(BufReader::new(File::open(file_name)?));
     let mut decoder = DecodeCursor::new(segments)?;
@@ -34,6 +33,10 @@ fn main() -> io::Result<()> {
         sum += buffer[..decoded].iter().sum::<u32>() as u64;
         decoded = decoder.decode(&mut buffer)?;
     }
+
+    // The sum of first N elements (arithmetic progression) should be N * (N + 1) / 2
+    let elements = elements as u64;
+    assert!(sum == elements * (elements + 1) / 2);
 
     println!(
         "Decoded {} elements in {}ms",

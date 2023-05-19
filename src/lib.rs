@@ -19,9 +19,11 @@ byte each). Each control word describe length of 4 numbers in the data stream (2
 [pub]: https://arxiv.org/abs/1209.2137
 [blog-post]: https://lemire.me/blog/2017/09/27/stream-vbyte-breaking-new-speed-records-for-integer-compression/
 */
-use std::arch::x86_64::{_mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128};
-use std::io::{self, BufRead, Write};
-use std::ptr::NonNull;
+use std::{
+    arch::x86_64::{_mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128},
+    io::{self, BufRead, Write},
+    ptr::NonNull,
+};
 
 #[allow(non_camel_case_types)]
 type u32x4 = [u32; 4];
