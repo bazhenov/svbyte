@@ -19,8 +19,9 @@ byte each). Each control word describe length of 4 numbers in the data stream (2
 [pub]: https://arxiv.org/abs/1209.2137
 [blog-post]: https://lemire.me/blog/2017/09/27/stream-vbyte-breaking-new-speed-records-for-integer-compression/
 */
-use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128};
+use std::arch::x86_64::{_mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128};
 use std::io::{self, BufRead, Write};
+use std::ptr::NonNull;
 
 #[allow(non_camel_case_types)]
 type u32x4 = [u32; 4];
@@ -32,24 +33,31 @@ type u32x4 = [u32; 4];
 /// [`u32_shuffle_masks`]: u32_shuffle_masks
 const MASKS: [(u32x4, u8); 256] = u32_shuffle_masks();
 
+/// Marker bytes of a [`SegmentHeader`]
 const SEGMENT_MAGIC: u16 = 0x0B0D;
 
-/// Provides asses to control and data streams of a segments
+/// Lenth of [`SegmentHeader`] in bytes
+const SEGMENT_HEADER_LENGTH: usize = 14;
+
+/// Provides facility for reading segments
 ///
 /// Each segment contains elements (integers) in encoded format. Each [`next`] method call
-/// moves this objects to the next segment and return number of elements in that segment.
+/// moves this objects to the next segment.
+///
+/// ## Motivation
+/// This trait exists to abstract [`DecodeCursor`] from logic of reading segments. If all the segments are
+/// in memory the most efficient way of decoding is decoding `[u8]` slices in memory. This maximize the
+/// decoding speed because no memory copy should be done. In case segments data are on the file systems,
+/// there should exists logic for reading next segment in a memory buffer. In latter case it's more
+/// appropriate to read segments one by one in a memory buffer of predefined size. [`Segments`] trait
+/// and its 2 base implementations: [`MemorySegments`] and [`BufReadSegments`] are providing those facilities.
 pub trait Segments {
-    /// Moves to the next segment and return number of elements encoded or zero
-    fn next(&mut self) -> io::Result<usize>;
-
-    /// Returns bytes of the current segment control stream
-    fn data_stream(&self) -> &[u8];
-
-    /// Returns bytes of the current segment data stream
-    fn control_stream(&self) -> &[u8];
+    /// Moves to the next segment and return number of the elements encoded in the segment as well as
+    /// control and data streams
+    fn next(&mut self) -> io::Result<Option<(usize, &[u8], &[u8])>>;
 }
 
-/// [`Segments`] implementation which reads segment from underlying [`BufRead`]
+/// Reads segment from underlying [`BufRead`]
 pub struct BufReadSegments<R> {
     source: R,
     control_stream: Vec<u8>,
@@ -67,94 +75,70 @@ impl<R> BufReadSegments<R> {
 }
 
 impl<R: BufRead> Segments for BufReadSegments<R> {
-    fn next(&mut self) -> io::Result<usize> {
+    fn next(&mut self) -> io::Result<Option<(usize, &[u8], &[u8])>> {
         let result = read_segment(
             &mut self.source,
             &mut self.control_stream,
             &mut self.data_stream,
         );
         match result {
-            Ok(elements) => Ok(elements),
+            Ok(elements) => Ok(Some((elements, &self.control_stream, &self.data_stream))),
             Err(e) => {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
-                    Ok(0)
+                    Ok(None)
                 } else {
                     Err(e)
                 }
             }
         }
     }
-
-    fn data_stream(&self) -> &[u8] {
-        &self.data_stream[..]
-    }
-
-    fn control_stream(&self) -> &[u8] {
-        &self.control_stream[..]
-    }
 }
 
 /// [`Segments`] implementation with all segment data in memory
 pub struct MemorySegments<'a> {
     data: &'a [u8],
-    control_stream: &'a [u8],
-    data_stream: &'a [u8],
 }
 
 impl<'a> MemorySegments<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            control_stream: &data[0..0],
-            data_stream: &data[0..0],
-        }
+        Self { data }
     }
 }
 
 impl<'a> Segments for MemorySegments<'a> {
-    fn next(&mut self) -> io::Result<usize> {
+    fn next(&mut self) -> io::Result<Option<(usize, &[u8], &[u8])>> {
         if self.data.is_empty() {
-            return Ok(0);
+            return Ok(None);
         }
 
         let segment = SegmentHeader::parse(self.data);
-        self.control_stream =
+        let control_stream =
             &self.data[SEGMENT_HEADER_LENGTH..SEGMENT_HEADER_LENGTH + segment.cs_length];
-        self.data_stream = &self.data[SEGMENT_HEADER_LENGTH + segment.cs_length
+        let data_stream = &self.data[SEGMENT_HEADER_LENGTH + segment.cs_length
             ..SEGMENT_HEADER_LENGTH + segment.cs_length + segment.ds_length];
         self.data = &self.data[SEGMENT_HEADER_LENGTH + segment.cs_length + segment.ds_length..];
 
-        Ok(segment.count)
-    }
-
-    #[inline]
-    fn data_stream(&self) -> &[u8] {
-        self.data_stream
-    }
-
-    #[inline]
-    fn control_stream(&self) -> &[u8] {
-        self.control_stream
+        Ok(Some((segment.count, control_stream, data_stream)))
     }
 }
 
-/// Stream VByte decoder
+/// Stream VByte decoding cursor
 ///
-/// Initialized using two streams: control stream and data streams.
-/// At the moment all data needs to be buffered into memory.
+/// Cursor allows to decode stream of elements using [`Segments`] as a source
+/// of decoding data. Implements [`Decoder`] trait.
 pub struct DecodeCursor<S: Segments> {
-    control_stream_pos: usize,
-    data_stream_pos: usize,
     elements_left: usize,
+    control_stream: *const u8,
+    data_stream: *const u8,
     segments: S,
 }
 
 impl<S: Segments> DecodeCursor<S> {
     pub fn new(segments: S) -> io::Result<Self> {
         Ok(Self {
-            control_stream_pos: 0,
-            data_stream_pos: 0,
             elements_left: 0,
+            control_stream: NonNull::dangling().as_ptr(),
+            data_stream: NonNull::dangling().as_ptr(),
             segments,
         })
     }
@@ -166,18 +150,21 @@ impl<S: Segments> DecodeCursor<S> {
             "Should be 0, got: {}",
             self.elements_left
         );
-        let elements = self.segments.next()?;
-        if elements > 0 {
-            self.control_stream_pos = 0;
-            self.data_stream_pos = 0;
+
+        if let Some((elements, cs, ds)) = self.segments.next()? {
+            self.control_stream = cs.as_ptr();
+            self.data_stream = ds.as_ptr();
             self.elements_left = elements;
+            Ok(elements)
+        } else {
+            Ok(0)
         }
-        Ok(elements)
     }
 }
 
-const SEGMENT_HEADER_LENGTH: usize = 14;
-
+/// Segment Header
+///
+/// Each segment starts with a header described in the [`EncodeCursor`] documentation.
 #[derive(Debug, PartialEq)]
 struct SegmentHeader {
     count: usize,
@@ -260,53 +247,49 @@ fn read_segment(input: &mut impl BufRead, cs: &mut Vec<u8>, ds: &mut Vec<u8>) ->
 
 impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
     fn decode(&mut self, buffer: &mut [u32]) -> io::Result<usize> {
+        /// Number of decoded elements per iteration
+        const DECODE_WIDTH: usize = 4;
         assert!(
-            buffer.len() >= 4,
-            "Buffer should be at least 4 elements long"
+            buffer.len() >= DECODE_WIDTH,
+            "Buffer should be at least {} elements long",
+            DECODE_WIDTH
         );
-        let control_stream_len = self.segments.control_stream().len();
-        if self.control_stream_pos >= control_stream_len && self.refill()? == 0 {
+        if self.elements_left == 0 && self.refill()? == 0 {
             return Ok(0);
         }
 
-        let iterations = buffer.len() / 4;
-        let iterations =
-            iterations.min(self.segments.control_stream()[self.control_stream_pos..].len());
+        let iterations = buffer.len() / DECODE_WIDTH;
+        let iterations = iterations.min((self.elements_left + DECODE_WIDTH - 1) / DECODE_WIDTH);
         let mut iterations_left = iterations;
 
-        let mut data_stream = self.segments.data_stream()[self.data_stream_pos..].as_ptr();
-        let mut data_stream_offset = 0;
+        let mut data_stream = self.data_stream;
+        let mut control_stream = self.control_stream;
+        let mut output = buffer.as_mut_ptr() as *mut u32x4;
 
-        let mut output = buffer.as_mut_ptr();
-        let mut control_word = self.segments.control_stream()[self.control_stream_pos..].as_ptr();
-
-        // 8 wide decode
+        // Decode loop unrolling
         const UNROLL_FACTOR: usize = 8;
         while iterations_left >= UNROLL_FACTOR {
             for _ in 0..UNROLL_FACTOR {
-                let encoded_len = simd_decode(data_stream, output as *mut u32x4, control_word);
-                control_word = control_word.wrapping_add(1);
-                output = output.wrapping_add(4);
+                let encoded_len = simd_decode(data_stream, control_stream, output);
                 data_stream = data_stream.wrapping_add(encoded_len as usize);
-                data_stream_offset += encoded_len as usize;
+                output = output.wrapping_add(1);
+                control_stream = control_stream.wrapping_add(1);
             }
 
             iterations_left -= UNROLL_FACTOR;
         }
 
         // Tail decode
-        while iterations_left > 0 {
-            let encoded_len = simd_decode(data_stream, output as *mut u32x4, control_word);
-            output = output.wrapping_add(4);
-            control_word = control_word.wrapping_add(1);
+        for _ in 0..iterations_left {
+            let encoded_len = simd_decode(data_stream, control_stream, output);
             data_stream = data_stream.wrapping_add(encoded_len as usize);
-            data_stream_offset += encoded_len as usize;
-            iterations_left -= 1;
+            output = output.wrapping_add(1);
+            control_stream = control_stream.wrapping_add(1);
         }
 
-        self.data_stream_pos += data_stream_offset;
-        self.control_stream_pos += iterations;
-        let decoded = (iterations * 4).min(self.elements_left);
+        self.control_stream = control_stream;
+        self.data_stream = data_stream;
+        let decoded = (iterations * DECODE_WIDTH).min(self.elements_left);
         self.elements_left -= decoded;
         Ok(decoded)
     }
@@ -325,15 +308,15 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
 /// let result = (result >> 4) + (result & 0b1111) + 4;
 /// ```
 /// Unfortunatley, this approach is slower then memoized length. There is a mention of this approach can be faster
-/// when using u32 control words, which implies decoding a batch of size 16[^1].
+/// when using `u32` control words, which implies decoding a batch of size 16[^1].
 ///
 /// [^1]: [Bit hacking versus memoization: a Stream VByte example](https://lemire.me/blog/2017/11/28/bit-hacking-versus-memoization-a-stream-vbyte-example/)
 #[inline]
-fn simd_decode(input: *const u8, output: *mut u32x4, control_word: *const u8) -> u8 {
+fn simd_decode(input: *const u8, control_word: *const u8, output: *mut u32x4) -> u8 {
     unsafe {
         let (ref mask, encoded_len) = MASKS[*control_word as usize];
-        let mask = _mm_loadu_si128(mask.as_ptr() as *const __m128i);
-        let input = _mm_loadu_si128(input as *const __m128i);
+        let mask = _mm_loadu_si128(mask.as_ptr().cast());
+        let input = _mm_loadu_si128(input.cast());
         let answer = _mm_shuffle_epi8(input, mask);
         _mm_storeu_si128(output.cast(), answer);
 
@@ -373,18 +356,23 @@ register. For addressing 16 bytes we need log(16) = 4 bits. So bits 0:3 of each 
 index. MSB of each byte indicating if corresponding byte in output register should be zeroed out. 4 least significant
 bits are non effective if MSB is set.
 
+`pshufb` SSE instruction visualization.
+
 ```graph
-Byte offsets:              0        1        2        3        4 ... 15
-Input register:         0x03     0x15     0x22     0x19     0x08 ...
-                         |                 |        |        |
-                         |        +--------+        |        |
-                         |        |                 |        |
-                         |        |          +---------------+
-                         |        |          |      |
-                         +-----------------------------------+
-                                  |          |      |        |
-Mask register:      10000000 00000010 00000100 00000011 00000000 ...
-Output register:        0x00     0x22     0x08     0x19     0x03 ...
+  Byte offsets:           0        1        2        3        4
+                  ┌────────┬────────┬────────┬────────┬────────┬───┐
+Input Register:   │   0x03 │   0x15 │   0x22 │   0x19 │   0x08 │...│
+                  └────▲───┴────────┴────▲───┴────▲───┴────▲───┴───┘
+                       │        ┌────────┘        │        │
+                       │        │        ┌─────────────────┘
+                       │        │        │        │
+                       └───────────────────────────────────┐
+                                │        │        │        │
+                  ┌────────┬────┴───┬────┴───┬────┴───┬────┴───┬───┐
+  Mask Register:  │   0x80 │   0x02 │   0x04 │   0x03 │   0x00 │...│
+                  ├────────┼────────┼────────┼────────┼────────┼───┤
+Output Register:  │   0x00 │   0x22 │   0x08 │   0x19 │   0x03 │...│
+                  └────────┴────────┴────────┴────────┴────────┴───┘
 ```
 
 See [`_mm_shuffle_epi8()`][_mm_shuffle_epi8] documentation.
@@ -439,12 +427,12 @@ Data format follows this structure:
 ```
 
 - `MAGIC` is always 0x0B0D;
-- `COUNT` the number of elements encoded in the segment (u32);
-- `CS SIZE` is the size of control stream in bytes (u32);
-- `DS SIZE` is the size of data stream in bytes (u32);
+- `COUNT` the number of elements encoded in the segment (`u32`);
+- `CS SIZE` is the size of control stream in bytes (`u32`);
+- `DS SIZE` is the size of data stream in bytes (`u32`);
 - `CS` and `DS` and control and data streams.
 
-Segment header (`MAGIC`, `CS SIZE`, `DS SIZE`) is enough to calculate the whole segment size.
+Segment header (`MAGIC`, `COUNT`, `CS SIZE`, `DS SIZE`) is enough to calculate the whole segment size.
 Segments follows each other until EOF of a stream reached.
 */
 pub struct EncodeCursor<W> {
@@ -541,7 +529,7 @@ impl<W: Write> EncodeCursor<W> {
 }
 
 /// Represents an object that can decode a stream of data into a buffer of fixed size. A type parameter `T` specifies /// the type of the elements in the buffer.
-pub trait Decoder<T: Default + Copy> {
+pub trait Decoder<T: Copy + From<u8>> {
     /// Decodes next elements into buffer
     ///
     /// Decodes next elements into buffer and returns the number of decoded elements, or zero if and end of the
@@ -553,7 +541,7 @@ pub trait Decoder<T: Default + Copy> {
     where
         Self: Sized,
     {
-        let mut buffer = [Default::default(); 128];
+        let mut buffer = [0u8.into(); 128];
         let mut result = vec![];
         let mut len = self.decode(&mut buffer)?;
         while len > 0 {
