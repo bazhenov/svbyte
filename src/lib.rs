@@ -154,6 +154,18 @@ impl<S: Segments> DecodeCursor<S> {
         );
 
         if let Some((elements, cs, ds)) = self.segments.next()? {
+            assert!(
+                cs.len() * 4 >= elements,
+                "Invalid control stream length. Expected: {}, got: {}",
+                (elements + 3) / 4,
+                cs.len()
+            );
+            assert!(
+                ds.len() >= elements,
+                "Invalid data stream length. Expected: >={}, got: {}",
+                elements,
+                ds.len()
+            );
             self.control_stream = cs.as_ptr();
             self.data_stream = ds.as_ptr();
             self.elements_left = elements;
@@ -260,38 +272,38 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
             return Ok(0);
         }
 
-        let iterations = buffer.len() / DECODE_WIDTH;
-        let iterations = iterations.min((self.elements_left + DECODE_WIDTH - 1) / DECODE_WIDTH);
-        let mut iterations_left = iterations;
+        let mut iterations = buffer.len() / DECODE_WIDTH;
+        iterations = iterations.min((self.elements_left + DECODE_WIDTH - 1) / DECODE_WIDTH);
+        let decoded = iterations * DECODE_WIDTH;
 
         let mut data_stream = self.data_stream;
         let mut control_stream = self.control_stream;
-        let mut output = buffer.as_mut_ptr() as *mut u32x4;
+        let mut buffer = buffer.as_mut_ptr() as *mut u32x4;
 
         // Decode loop unrolling
         const UNROLL_FACTOR: usize = 8;
-        while iterations_left >= UNROLL_FACTOR {
+        while iterations >= UNROLL_FACTOR {
             for _ in 0..UNROLL_FACTOR {
-                let encoded_len = simd_decode(data_stream, control_stream, output);
+                let encoded_len = simd_decode(data_stream, control_stream, buffer);
                 data_stream = data_stream.wrapping_add(encoded_len as usize);
-                output = output.wrapping_add(1);
+                buffer = buffer.wrapping_add(1);
                 control_stream = control_stream.wrapping_add(1);
             }
 
-            iterations_left -= UNROLL_FACTOR;
+            iterations -= UNROLL_FACTOR;
         }
 
         // Tail decode
-        for _ in 0..iterations_left {
-            let encoded_len = simd_decode(data_stream, control_stream, output);
+        for _ in 0..iterations {
+            let encoded_len = simd_decode(data_stream, control_stream, buffer);
             data_stream = data_stream.wrapping_add(encoded_len as usize);
-            output = output.wrapping_add(1);
+            buffer = buffer.wrapping_add(1);
             control_stream = control_stream.wrapping_add(1);
         }
 
         self.control_stream = control_stream;
         self.data_stream = data_stream;
-        let decoded = (iterations * DECODE_WIDTH).min(self.elements_left);
+        let decoded = decoded.min(self.elements_left);
         self.elements_left -= decoded;
         Ok(decoded)
     }
