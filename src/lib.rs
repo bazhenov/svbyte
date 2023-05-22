@@ -4,12 +4,43 @@ This library provides encoding/decoding primitives for Stream VByte encoding.
 Stream VByte encoding is a SIMD accelerated algorithm of varint decompression. It is used in a search and database
 systems as a way of efficiently store and stream large number of variable length integers from a disk or main memory.
 
-The idea behind virnot is not to store leading bytes of the number, so large amount of relatively small numbers can be
-stored in a much more compact way. Varint encoding is frequently used with delta-encoding if numbers are stored in the
+The idea behind varint is to skip leading zero bytes of the number, so large amount of relatively small numbers can be
+stored eficiently. Varint encoding is frequently used with delta-encoding if numbers are stored in the
 ascending order. This way all the numbers are smaller by magnitude, hence better compression.
 
 Stream VByte is a storage format and an algorithm which allows to vectorize compressing and decompressing of numbers
 on a modern CPUs.
+
+Main types of this crate are [`DecodeCursor`] and [`EncodeCursor`].
+
+## Encoding
+
+```rust,no_run
+let output = BufWriter::new(File::create(file_name)?);
+let mut encoder = EncodeCursor::new(output);
+encoder.encode(&data);
+
+encoder.finish()?.flush()?;
+```
+
+## Decoding
+
+```rust,no_run
+let segments = BufReadSegments::new(BufReader::new(File::open(file_name)?));
+let mut decoder = DecodeCursor::new(segments)?;
+
+let mut buffer = [0u32; 128];
+let mut sum = 0u64;
+loop {
+    let decoded = decoder.decode(&mut buffer)?;
+    if decoded == 0 {
+        break;
+    }
+    sum += buffer[..decoded].iter().sum::<u32>() as u64;
+}
+```
+
+## Links
 
 - [Stream VByte: Faster Byte-Oriented Integer Compression][pub] by Daniel Lemire, Nathan Kurz, and Christoph Rupp
 - [Stream VByte: breaking new speed records for integer compression][blog-post] by Daniel Lemire
@@ -22,7 +53,6 @@ use std::{
     debug_assert,
     io::{self, BufRead, Write},
     mem,
-    ptr::NonNull,
 };
 
 #[allow(non_camel_case_types)]
@@ -43,7 +73,7 @@ const SEGMENT_HEADER_LENGTH: usize = 14;
 
 /// Provides facility for reading segments
 ///
-/// Each segment contains elements (integers) in encoded format. Each [`next`] method call
+/// Each segment contains elements (integers) in encoded format. Each [`Segments::next`] method call
 /// moves this objects to the next segment.
 ///
 /// ## Motivation
@@ -54,15 +84,17 @@ const SEGMENT_HEADER_LENGTH: usize = 14;
 /// appropriate to read segments one by one in a memory buffer of predefined size. [`Segments`] trait
 /// and its 2 base implementations: [`MemorySegments`] and [`BufReadSegments`] are providing those facilities.
 pub trait Segments {
-    /// Moves to the next segment and return number of the elements encoded in the segment as well as
-    /// control and data streams
-    fn next(&mut self) -> io::Result<Option<(usize, &[u8], &[u8])>>;
+    /// Moves to the next segment and return number of the elements encoded in the segment
+    fn next(&mut self) -> io::Result<usize>;
 
+    /// Returns the current segment's data stream
     fn data_stream(&self) -> &[u8];
+
+    /// Returns the current segment's control stream
     fn control_stream(&self) -> &[u8];
 }
 
-/// Reads segment from underlying [`BufRead`]
+/// Reads a segment from an underlying [`BufRead`]
 pub struct BufReadSegments<R> {
     source: R,
     control_stream: Vec<u8>,
@@ -80,17 +112,17 @@ impl<R> BufReadSegments<R> {
 }
 
 impl<R: BufRead> Segments for BufReadSegments<R> {
-    fn next(&mut self) -> io::Result<Option<(usize, &[u8], &[u8])>> {
+    fn next(&mut self) -> io::Result<usize> {
         let result = read_segment(
             &mut self.source,
             &mut self.control_stream,
             &mut self.data_stream,
         );
         match result {
-            Ok(elements) => Ok(Some((elements, &self.control_stream, &self.data_stream))),
+            Ok(elements) => Ok(elements),
             Err(e) => {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
-                    Ok(None)
+                    Ok(0)
                 } else {
                     Err(e)
                 }
@@ -125,9 +157,9 @@ impl<'a> MemorySegments<'a> {
 }
 
 impl<'a> Segments for MemorySegments<'a> {
-    fn next(&mut self) -> io::Result<Option<(usize, &[u8], &[u8])>> {
+    fn next(&mut self) -> io::Result<usize> {
         if self.data.is_empty() {
-            return Ok(None);
+            return Ok(0);
         }
 
         let segment = SegmentHeader::parse(self.data);
@@ -137,7 +169,7 @@ impl<'a> Segments for MemorySegments<'a> {
             ..SEGMENT_HEADER_LENGTH + segment.cs_length + segment.ds_length];
         self.data = &self.data[SEGMENT_HEADER_LENGTH + segment.cs_length + segment.ds_length..];
 
-        Ok(Some((segment.count, self.control_stream, self.data_stream)))
+        Ok(segment.count)
     }
 
     fn data_stream(&self) -> &[u8] {
@@ -148,14 +180,12 @@ impl<'a> Segments for MemorySegments<'a> {
     }
 }
 
-/// Stream VByte decoding cursor
+/// Decodes integers
 ///
-/// Cursor allows to decode stream of elements using [`Segments`] as a source
-/// of decoding data. Implements [`Decoder`] trait.
+/// Cursor allows to decode stream of elements using one of the [`Segments`] implementations as a source
+/// of decoding data.
 pub struct DecodeCursor<S: Segments> {
     elements_left: usize,
-    control_stream: *const u8,
-    data_stream: *const u8,
     control_stream_offset: usize,
     data_stream_offset: usize,
     segments: S,
@@ -165,8 +195,6 @@ impl<S: Segments> DecodeCursor<S> {
     pub fn new(segments: S) -> io::Result<Self> {
         Ok(Self {
             elements_left: 0,
-            control_stream: NonNull::dangling().as_ptr(),
-            data_stream: NonNull::dangling().as_ptr(),
             control_stream_offset: 0,
             data_stream_offset: 0,
             segments,
@@ -181,7 +209,10 @@ impl<S: Segments> DecodeCursor<S> {
             self.elements_left
         );
 
-        if let Some((elements, cs, ds)) = self.segments.next()? {
+        let elements = self.segments.next()?;
+        if elements > 0 {
+            let cs = self.segments.control_stream();
+            let ds = self.segments.data_stream();
             assert!(
                 cs.len() * 4 >= elements,
                 "Invalid control stream length. Expected: {}, got: {}",
@@ -194,15 +225,11 @@ impl<S: Segments> DecodeCursor<S> {
                 elements,
                 ds.len()
             );
-            self.control_stream = cs.as_ptr();
-            self.data_stream = ds.as_ptr();
             self.data_stream_offset = 0;
             self.control_stream_offset = 0;
             self.elements_left = elements;
-            Ok(elements)
-        } else {
-            Ok(0)
         }
+        Ok(elements)
     }
 }
 
@@ -513,7 +540,7 @@ Data format follows this structure:
 └───────┴───────┴─────────┴─────────┴────────┴────────┘
 ```
 
-- `MAGIC` is always 0x0B0D;
+- `MAGIC` is always `0x0B0D`;
 - `COUNT` the number of elements encoded in the segment (`u32`);
 - `CS SIZE` is the size of control stream in bytes (`u32`);
 - `DS SIZE` is the size of data stream in bytes (`u32`);
@@ -606,9 +633,10 @@ impl<W: Write> EncodeCursor<W> {
         Ok(())
     }
 
-    /// Returns output stream stream back to the client
+    /// Finish pending writes
     ///
-    /// All pending writes are not *flushed*. It is a responsibility of a callee to flush if needed.
+    /// Write last segment to the output and return underlying [`Write`] to the client.
+    /// Writes are **not flushed**. It is a responsibility of a client to flush if needed.
     pub fn finish(mut self) -> io::Result<W> {
         self.write_segment()?;
         Ok(*self.output)
@@ -617,13 +645,14 @@ impl<W: Write> EncodeCursor<W> {
 
 /// Represents an object that can decode a stream of data into a buffer of fixed size. A type parameter `T` specifies /// the type of the elements in the buffer.
 pub trait Decoder<T: Copy + From<u8>> {
-    /// Decodes next elements into buffer
+    /// Decodes next elements into the buffer
     ///
-    /// Decodes next elements into buffer and returns the number of decoded elements, or zero if and end of the
+    /// Decodes next elements and returns the number of decoded elements, or zero if the end of the
     /// stream is reached. There is no guarantee about buffer element past the return value. They might be
     /// left unchanged or zeroed out by this method.
     fn decode(&mut self, buffer: &mut [T]) -> io::Result<usize>;
 
+    /// Returns the content of a stream in a Vec
     fn to_vec(mut self) -> io::Result<Vec<T>>
     where
         Self: Sized,
