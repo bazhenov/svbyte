@@ -2,6 +2,14 @@
 name = "svbyte"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Fast Stream VByte implementation"
+homepage = "https://github.com/bazhenov/stream-vbyte"
+documentation = "https://github.com/bazhenov/stream-vbyte"
+repository = "https://github.com/bazhenov/stream-vbyte"
+readme = "README.md"
+categories = ["data-structures", "compression"]
+keywords = ["database", "serialization", "networking"]
 
 [dependencies]
 
