@@ -344,7 +344,9 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
 
         let mut data_stream_offset = self.data_stream_offset;
         let control_stream = &self.segments.control_stream()[self.control_stream_offset..];
-        let data_stream = &self.segments.data_stream()[data_stream_offset..];
+        let data_stream = self.segments.data_stream();
+        let data_stream = &data_stream[data_stream_offset..];
+        let data_stream_end = (data_stream.last().unwrap() as *const u8).wrapping_add(1);
         let mut data_stream = data_stream.as_ptr();
 
         /*
@@ -374,8 +376,8 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
             for _ in 0..UNROLL_FACTOR {
                 let encoded_len = unsafe {
                     debug_assert!(
-                        self.segments.data_stream()[data_stream_offset..].len() >= 16,
-                        "At least 16 bytes should be available in data stream"
+                        data_stream.wrapping_add(16) <= data_stream_end,
+                        "At least 16 bytes should be available in the data stream"
                     );
                     let data_stream = mem::transmute(data_stream);
                     let output = mem::transmute(buffer);
@@ -396,8 +398,8 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
         while iterations > 0 {
             let encoded_len = unsafe {
                 debug_assert!(
-                    self.segments.data_stream()[data_stream_offset..].len() >= 16,
-                    "At least 16 bytes should be available in data stream"
+                    data_stream.wrapping_add(16) <= data_stream_end,
+                    "At least 16 bytes should be available in the data stream"
                 );
                 let data_stream = mem::transmute(data_stream);
                 let output = mem::transmute(buffer);
@@ -420,7 +422,7 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
     }
 }
 
-/// Decoding SIMD kernel using SSE intrinsics
+/// Decoding SIMD kernel using SSSE3 intrinsics
 ///
 /// Types of this function tries to implement safety guardrails as much as possible. Namely:
 /// `output` - is a reference to the buffer of 4 u32 values;
