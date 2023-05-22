@@ -496,7 +496,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "stream-decode"
+name = "svbyte"
 version = "0.1.0"
 dependencies = [
  "criterion",
