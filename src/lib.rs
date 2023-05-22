@@ -373,11 +373,10 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
         while iterations >= UNROLL_FACTOR {
             for _ in 0..UNROLL_FACTOR {
                 let encoded_len = unsafe {
-                    // TODO data stream padding
-                    // debug_assert!(
-                    //     self.segments.data_stream()[data_stream_offset..].len() >= 16,
-                    //     "At least 16 bytes should be available in data stream"
-                    // );
+                    debug_assert!(
+                        self.segments.data_stream()[data_stream_offset..].len() >= 16,
+                        "At least 16 bytes should be available in data stream"
+                    );
                     let data_stream = mem::transmute(data_stream);
                     let output = mem::transmute(buffer);
                     simd_decode(data_stream, *control_words, output)
@@ -396,11 +395,10 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
         // Tail decode
         while iterations > 0 {
             let encoded_len = unsafe {
-                // TODO data stream padding
-                // debug_assert!(
-                //     self.segments.data_stream()[data_stream_offset..].len() >= 16,
-                //     "At least 16 bytes should be available in data stream"
-                // );
+                debug_assert!(
+                    self.segments.data_stream()[data_stream_offset..].len() >= 16,
+                    "At least 16 bytes should be available in data stream"
+                );
                 let data_stream = mem::transmute(data_stream);
                 let output = mem::transmute(buffer);
                 simd_decode(data_stream, *control_words, output)
@@ -623,14 +621,22 @@ impl<W: Write> EncodeCursor<W> {
 
     fn write_segment(&mut self) -> io::Result<()> {
         let tail = self.written % 4;
-        // we need to binary shift last control left if number of elements
-        // not multiple of 4, otherwise last control will be misaligned
+        // we need to shift last control byte left if number of elements
+        // not multiple of 4, otherwise it will be misaligned
         if tail > 0 {
             let control_word = self.control_stream.last_mut().unwrap();
             *control_word <<= 2 * (4 - tail);
-            for _ in 0..(4 - tail) {
-                self.data_stream.write_all(&[0])?;
-            }
+        }
+
+        // Next we need to pad the data stream so that last quadruple will have 16 bytes at the end.
+        // Otherwise algorithm can cause loads from partially allocated memory when loading from
+        // the data stream to SIMD vector
+        let control_word = self.control_stream.last().unwrap();
+        let quadruple_length =
+            byte_to_4_length(*control_word).iter().sum::<u8>() as usize - (4 - tail);
+
+        for _ in quadruple_length..16 {
+            self.data_stream.write_all(&[0])?;
         }
 
         let header = SegmentHeader::new(
@@ -681,6 +687,18 @@ pub trait Decoder<T: Copy + From<u8>> {
     }
 }
 
+/// Decoding control byte to 4 corresponding length
+///
+/// The length of each integer es encoded as 2 bits: from 00 (length 1) to 11 (length 4).
+fn byte_to_4_length(input: u8) -> [u8; 4] {
+    [
+        (input.rotate_left(2) & 0b11) + 1,
+        (input.rotate_left(4) & 0b11) + 1,
+        (input.rotate_left(6) & 0b11) + 1,
+        (input.rotate_left(8) & 0b11) + 1,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,7 +717,8 @@ mod tests {
                 0x01, 0x00, 0x00, //
                 0x01, 0x00, 0x00, 0x00, //
                 0x01, 0x00, 0x00, //
-                0x00, 0x00, 0x00, // 3 bytes a padding so segment size is multiple of 4
+                // 13 byte padding so last quadruple is 16 byte long
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             ]
         );
 
@@ -815,18 +834,6 @@ mod tests {
         read_segment(&mut source, &mut cs, &mut ds).unwrap();
         source.seek(SeekFrom::Start(0)).unwrap();
         (cs, ds, source)
-    }
-
-    /// Decoding control byte to 4 corresponding length
-    ///
-    /// The length of each integer es encoded as 2 bits: from 00 (length 1) to 11 (length 4).
-    fn byte_to_4_length(input: u8) -> [u8; 4] {
-        [
-            (input.rotate_left(2) & 0b11) + 1,
-            (input.rotate_left(4) & 0b11) + 1,
-            (input.rotate_left(6) & 0b11) + 1,
-            (input.rotate_left(8) & 0b11) + 1,
-        ]
     }
 
     /// Generates "weighed" dataset fortesting purposes
