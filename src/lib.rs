@@ -19,7 +19,9 @@ on a modern CPUs.
 */
 use std::{
     arch::x86_64::{_mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128},
+    debug_assert,
     io::{self, BufRead, Write},
+    mem,
     ptr::NonNull,
 };
 
@@ -55,6 +57,9 @@ pub trait Segments {
     /// Moves to the next segment and return number of the elements encoded in the segment as well as
     /// control and data streams
     fn next(&mut self) -> io::Result<Option<(usize, &[u8], &[u8])>>;
+
+    fn data_stream(&self) -> &[u8];
+    fn control_stream(&self) -> &[u8];
 }
 
 /// Reads segment from underlying [`BufRead`]
@@ -92,16 +97,30 @@ impl<R: BufRead> Segments for BufReadSegments<R> {
             }
         }
     }
+
+    fn data_stream(&self) -> &[u8] {
+        self.control_stream.as_ref()
+    }
+
+    fn control_stream(&self) -> &[u8] {
+        self.data_stream.as_ref()
+    }
 }
 
 /// [`Segments`] implementation with all segment data in memory
 pub struct MemorySegments<'a> {
     data: &'a [u8],
+    control_stream: &'a [u8],
+    data_stream: &'a [u8],
 }
 
 impl<'a> MemorySegments<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data }
+        Self {
+            data,
+            control_stream: &data[0..0],
+            data_stream: &data[0..0],
+        }
     }
 }
 
@@ -112,13 +131,20 @@ impl<'a> Segments for MemorySegments<'a> {
         }
 
         let segment = SegmentHeader::parse(self.data);
-        let control_stream =
+        self.control_stream =
             &self.data[SEGMENT_HEADER_LENGTH..SEGMENT_HEADER_LENGTH + segment.cs_length];
-        let data_stream = &self.data[SEGMENT_HEADER_LENGTH + segment.cs_length
+        self.data_stream = &self.data[SEGMENT_HEADER_LENGTH + segment.cs_length
             ..SEGMENT_HEADER_LENGTH + segment.cs_length + segment.ds_length];
         self.data = &self.data[SEGMENT_HEADER_LENGTH + segment.cs_length + segment.ds_length..];
 
-        Ok(Some((segment.count, control_stream, data_stream)))
+        Ok(Some((segment.count, self.control_stream, self.data_stream)))
+    }
+
+    fn data_stream(&self) -> &[u8] {
+        self.data_stream
+    }
+    fn control_stream(&self) -> &[u8] {
+        self.control_stream
     }
 }
 
@@ -130,6 +156,8 @@ pub struct DecodeCursor<S: Segments> {
     elements_left: usize,
     control_stream: *const u8,
     data_stream: *const u8,
+    control_stream_offset: usize,
+    data_stream_offset: usize,
     segments: S,
 }
 
@@ -139,6 +167,8 @@ impl<S: Segments> DecodeCursor<S> {
             elements_left: 0,
             control_stream: NonNull::dangling().as_ptr(),
             data_stream: NonNull::dangling().as_ptr(),
+            control_stream_offset: 0,
+            data_stream_offset: 0,
             segments,
         })
     }
@@ -166,6 +196,8 @@ impl<S: Segments> DecodeCursor<S> {
             );
             self.control_stream = cs.as_ptr();
             self.data_stream = ds.as_ptr();
+            self.data_stream_offset = 0;
+            self.control_stream_offset = 0;
             self.elements_left = elements;
             Ok(elements)
         } else {
@@ -259,7 +291,7 @@ fn read_segment(input: &mut impl BufRead, cs: &mut Vec<u8>, ds: &mut Vec<u8>) ->
 
 impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
     fn decode(&mut self, buffer: &mut [u32]) -> io::Result<usize> {
-        /// Number of decoded elements per iteration
+        // Number of elements decoded per iteration
         const DECODE_WIDTH: usize = 4;
         assert!(
             buffer.len() >= DECODE_WIDTH,
@@ -270,37 +302,80 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
             return Ok(0);
         }
 
-        let mut iterations = buffer.len() / DECODE_WIDTH;
-        iterations = iterations.min((self.elements_left + DECODE_WIDTH - 1) / DECODE_WIDTH);
+        let mut data_stream_offset = self.data_stream_offset;
+        let control_stream = &self.segments.control_stream()[self.control_stream_offset..];
+        let data_stream = &self.segments.data_stream()[data_stream_offset..];
+        let mut data_stream = data_stream.as_ptr();
+
+        /*
+        Safety considerations!
+
+        This code relies heavily on pointers. To make all pointer arithmetic safe several rules must be obeyed.
+
+        1. number of iterations should be limited by both output buffer length as well as the number of elements left
+           in the data and control streams
+        2. each iteration control stream and output buffer pointers are moved by 1. Therefore, all pointers should be
+           of the type which is consumed/produced in each iteration.
+        3. the only exception is the data stream whose type is `*const u8` because the data stream moved different
+           amounts of bytes each iteration.
+        */
+        let mut iterations = buffer.len() / 4;
+        iterations = iterations.min(control_stream.len());
+
+        self.control_stream_offset += iterations;
         let decoded = iterations * DECODE_WIDTH;
 
-        let mut data_stream = self.data_stream;
-        let mut control_stream = self.control_stream;
-        let mut buffer = buffer.as_mut_ptr() as *mut u32x4;
+        let mut buffer: *mut u32x4 = buffer.as_mut_ptr().cast();
+        let mut control_words = control_stream.as_ptr();
 
         // Decode loop unrolling
         const UNROLL_FACTOR: usize = 8;
         while iterations >= UNROLL_FACTOR {
             for _ in 0..UNROLL_FACTOR {
-                let encoded_len = unsafe { simd_decode(data_stream, control_stream, buffer) };
-                data_stream = data_stream.wrapping_add(encoded_len as usize);
+                let encoded_len = unsafe {
+                    // TODO data stream padding
+                    // debug_assert!(
+                    //     self.segments.data_stream()[data_stream_offset..].len() >= 16,
+                    //     "At least 16 bytes should be available in data stream"
+                    // );
+                    let data_stream = mem::transmute(data_stream);
+                    let output = mem::transmute(buffer);
+                    simd_decode(data_stream, *control_words, output)
+                };
+
+                control_words = control_words.wrapping_add(1);
                 buffer = buffer.wrapping_add(1);
-                control_stream = control_stream.wrapping_add(1);
+
+                data_stream = data_stream.wrapping_add(encoded_len as usize);
+                data_stream_offset += encoded_len as usize;
             }
 
             iterations -= UNROLL_FACTOR;
         }
 
         // Tail decode
-        for _ in 0..iterations {
-            let encoded_len = unsafe { simd_decode(data_stream, control_stream, buffer) };
-            data_stream = data_stream.wrapping_add(encoded_len as usize);
+        while iterations > 0 {
+            let encoded_len = unsafe {
+                // TODO data stream padding
+                // debug_assert!(
+                //     self.segments.data_stream()[data_stream_offset..].len() >= 16,
+                //     "At least 16 bytes should be available in data stream"
+                // );
+                let data_stream = mem::transmute(data_stream);
+                let output = mem::transmute(buffer);
+                simd_decode(data_stream, *control_words, output)
+            };
+
+            control_words = control_words.wrapping_add(1);
             buffer = buffer.wrapping_add(1);
-            control_stream = control_stream.wrapping_add(1);
+
+            data_stream = data_stream.wrapping_add(encoded_len as usize);
+            data_stream_offset += encoded_len as usize;
+
+            iterations -= 1;
         }
 
-        self.control_stream = control_stream;
-        self.data_stream = data_stream;
+        self.data_stream_offset = data_stream_offset;
         let decoded = decoded.min(self.elements_left);
         self.elements_left -= decoded;
         Ok(decoded)
@@ -324,12 +399,14 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
 ///
 /// [^1]: [Bit hacking versus memoization: a Stream VByte example](https://lemire.me/blog/2017/11/28/bit-hacking-versus-memoization-a-stream-vbyte-example/)
 #[inline]
-unsafe fn simd_decode(input: *const u8, control_word: *const u8, output: *mut u32x4) -> u8 {
-    let (ref mask, encoded_len) = MASKS[*control_word as usize];
-    let mask = _mm_loadu_si128(mask.as_ptr().cast());
-    let input = _mm_loadu_si128(input.cast());
-    let answer = _mm_shuffle_epi8(input, mask);
-    _mm_storeu_si128(output.cast(), answer);
+fn simd_decode(input: &[u8; 16], control_word: u8, output: &mut u32x4) -> u8 {
+    let (ref mask, encoded_len) = MASKS[control_word as usize];
+    unsafe {
+        let mask = _mm_loadu_si128(mask.as_ptr().cast());
+        let input = _mm_loadu_si128(input.as_ptr().cast());
+        let answer = _mm_shuffle_epi8(input, mask);
+        _mm_storeu_si128(output.as_mut_ptr().cast(), answer);
+    }
 
     encoded_len
 }
