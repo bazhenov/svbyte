@@ -1,4 +1,3 @@
-#![feature(stdsimd)]
 /*!
 This library provides encoding/decoding primitives for Stream VByte encoding.
 
