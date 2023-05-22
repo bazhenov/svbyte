@@ -282,7 +282,7 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
         const UNROLL_FACTOR: usize = 8;
         while iterations >= UNROLL_FACTOR {
             for _ in 0..UNROLL_FACTOR {
-                let encoded_len = simd_decode(data_stream, control_stream, buffer);
+                let encoded_len = unsafe { simd_decode(data_stream, control_stream, buffer) };
                 data_stream = data_stream.wrapping_add(encoded_len as usize);
                 buffer = buffer.wrapping_add(1);
                 control_stream = control_stream.wrapping_add(1);
@@ -293,7 +293,7 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
 
         // Tail decode
         for _ in 0..iterations {
-            let encoded_len = simd_decode(data_stream, control_stream, buffer);
+            let encoded_len = unsafe { simd_decode(data_stream, control_stream, buffer) };
             data_stream = data_stream.wrapping_add(encoded_len as usize);
             buffer = buffer.wrapping_add(1);
             control_stream = control_stream.wrapping_add(1);
@@ -324,16 +324,14 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
 ///
 /// [^1]: [Bit hacking versus memoization: a Stream VByte example](https://lemire.me/blog/2017/11/28/bit-hacking-versus-memoization-a-stream-vbyte-example/)
 #[inline]
-fn simd_decode(input: *const u8, control_word: *const u8, output: *mut u32x4) -> u8 {
-    unsafe {
-        let (ref mask, encoded_len) = MASKS[*control_word as usize];
-        let mask = _mm_loadu_si128(mask.as_ptr().cast());
-        let input = _mm_loadu_si128(input.cast());
-        let answer = _mm_shuffle_epi8(input, mask);
-        _mm_storeu_si128(output.cast(), answer);
+unsafe fn simd_decode(input: *const u8, control_word: *const u8, output: *mut u32x4) -> u8 {
+    let (ref mask, encoded_len) = MASKS[*control_word as usize];
+    let mask = _mm_loadu_si128(mask.as_ptr().cast());
+    let input = _mm_loadu_si128(input.cast());
+    let answer = _mm_shuffle_epi8(input, mask);
+    _mm_storeu_si128(output.cast(), answer);
 
-        encoded_len
-    }
+    encoded_len
 }
 
 /**
