@@ -20,6 +20,9 @@ Stream VByte working using two data streams: control stream and data stream. Con
 byte each). Each control word describe length of 4 numbers in the data stream (2 bits per number, `00` - length 1,
 `01` - length 2 and so on).
 
+- [API Documentation](https://docs.rs/svbyte/latest/svbyte/)
+- [Examples](https://github.com/bazhenov/svbyte/tree/master/examples)
+
 ## Links
 
 - [Stream VByte: Faster Byte-Oriented Integer Compression][pub] by Daniel Lemire and Leonid Boytsov.
