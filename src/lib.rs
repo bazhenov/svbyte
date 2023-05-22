@@ -16,17 +16,28 @@ Main types of this crate are [`DecodeCursor`] and [`EncodeCursor`].
 ## Encoding
 
 ```rust,no_run
-let output = BufWriter::new(File::create(file_name)?);
+# use std::io::BufWriter;
+# use std::fs::File;
+# use svbyte::EncodeCursor;
+# use std::io::{self, Write};
+# fn main() -> io::Result<()> {
+let output = BufWriter::new(File::create("./encoded.bin")?);
 let mut encoder = EncodeCursor::new(output);
-encoder.encode(&data);
+encoder.encode(&[1, 2, 3, 4]);
 
 encoder.finish()?.flush()?;
+# Ok(())
+# }
 ```
 
 ## Decoding
 
 ```rust,no_run
-let segments = BufReadSegments::new(BufReader::new(File::open(file_name)?));
+# use std::fs::File;
+# use std::io::{self, BufReader};
+# use svbyte::{BufReadSegments, DecodeCursor, Decoder};
+# fn main() -> io::Result<()> {
+let segments = BufReadSegments::new(BufReader::new(File::open("./encoded.bin")?));
 let mut decoder = DecodeCursor::new(segments)?;
 
 let mut buffer = [0u32; 128];
@@ -38,6 +49,8 @@ loop {
     }
     sum += buffer[..decoded].iter().sum::<u32>() as u64;
 }
+# Ok(())
+# }
 ```
 
 ## Links
@@ -79,9 +92,9 @@ const SEGMENT_HEADER_LENGTH: usize = 14;
 /// ## Motivation
 /// This trait exists to abstract [`DecodeCursor`] from logic of reading segments. If all the segments are
 /// in memory the most efficient way of decoding is decoding `[u8]` slices in memory. This maximize the
-/// decoding speed because no memory copy should be done. In case segments data are on the file systems,
-/// there should exists logic for reading next segment in a memory buffer. In latter case it's more
-/// appropriate to read segments one by one in a memory buffer of predefined size. [`Segments`] trait
+/// decoding speed because no memory copy is needed. In case segments data are on the file system,
+/// some logic for reading next segment in a memory buffer is required. In this case it's more
+/// appropriate to read segments one by one in a memory buffer of a predefined size. [`Segments`] trait
 /// and its 2 base implementations: [`MemorySegments`] and [`BufReadSegments`] are providing those facilities.
 pub trait Segments {
     /// Moves to the next segment and return number of the elements encoded in the segment

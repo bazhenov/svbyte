@@ -3,7 +3,7 @@ use std::{
     io::{self, BufReader, BufWriter},
     time::Instant,
 };
-use stream_decode::{BufReadSegments, DecodeCursor, Decoder, EncodeCursor};
+use svbyte::{BufReadSegments, DecodeCursor, Decoder, EncodeCursor};
 
 fn main() -> io::Result<()> {
     let file_name = "./result.bin";

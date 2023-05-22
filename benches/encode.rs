@@ -2,7 +2,7 @@ use std::{io::Cursor, mem::size_of};
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use rand::{thread_rng, Rng};
-use stream_decode::EncodeCursor;
+use svbyte::EncodeCursor;
 
 fn criterion_benchmark(c: &mut Criterion) {
     let mut rng = thread_rng();

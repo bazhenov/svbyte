@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use rand::{thread_rng, Rng, RngCore};
 use std::io::Cursor;
-use stream_decode::{DecodeCursor, Decoder, EncodeCursor, MemorySegments};
+use svbyte::{DecodeCursor, Decoder, EncodeCursor, MemorySegments};
 
 fn criterion_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode");
