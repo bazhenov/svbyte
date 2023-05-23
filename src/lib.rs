@@ -372,6 +372,28 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
         let mut buffer: *mut u32x4 = buffer.as_mut_ptr().cast();
         let mut control_words = control_stream.as_ptr();
 
+        // Without manual loop unroll, performance is quite bad on Intel Xeon E3
+        // Decode loop unrolling
+        const UNROLL_FACTOR: usize = 4;
+        while iterations >= UNROLL_FACTOR {
+            for _ in 0..UNROLL_FACTOR {
+                debug_assert!(
+                    data_stream.wrapping_add(16) <= data_stream_end,
+                    "At least 16 bytes should be available in the data stream"
+                );
+                let encoded_len =
+                    unsafe { simd_decode(&*data_stream.cast(), *control_words, &mut *buffer) };
+
+                control_words = control_words.wrapping_add(1);
+                buffer = buffer.wrapping_add(1);
+
+                data_stream = data_stream.wrapping_add(encoded_len);
+                data_stream_offset += encoded_len;
+            }
+
+            iterations -= UNROLL_FACTOR;
+        }
+
         // Tail decode
         while iterations > 0 {
             debug_assert!(
