@@ -76,7 +76,7 @@ type u32x4 = [u32; 4];
 /// For more information see documentation to [`u32_shuffle_masks`]
 ///
 /// [`u32_shuffle_masks`]: u32_shuffle_masks
-const MASKS: [(u32x4, u8); 256] = u32_shuffle_masks();
+const MASKS: [(u32x4, usize); 256] = u32_shuffle_masks();
 
 /// Marker bytes of a [`SegmentHeader`]
 const SEGMENT_MAGIC: u16 = 0x0B0D;
@@ -417,7 +417,7 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
 ///
 /// [^1]: [Bit hacking versus memoization: a Stream VByte example](https://lemire.me/blog/2017/11/28/bit-hacking-versus-memoization-a-stream-vbyte-example/)
 #[inline]
-fn simd_decode(input: &[u8; 16], control_word: u8, output: &mut u32x4) -> u8 {
+fn simd_decode(input: &[u8; 16], control_word: u8, output: &mut u32x4) -> usize {
     let (ref mask, encoded_len) = MASKS[control_word as usize];
     unsafe {
         let mask = _mm_loadu_si128(mask.as_ptr().cast());
@@ -484,8 +484,8 @@ See [`_mm_shuffle_epi8()`][_mm_shuffle_epi8] documentation.
 
 [_mm_shuffle_epi8]: https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=shuffle_epi8&ig_expand=6097
 */
-const fn u32_shuffle_masks() -> [(u32x4, u8); 256] {
-    let mut masks = [([0u32; 4], 0u8); 256];
+const fn u32_shuffle_masks() -> [(u32x4, usize); 256] {
+    let mut masks = [([0u32; 4], 0usize); 256];
 
     let mut a = 1;
     while a <= 4 {
@@ -506,7 +506,7 @@ const fn u32_shuffle_masks() -> [(u32x4, u8); 256] {
                     // counting in the index must be 0 based (eg. length of 1 is `00`, not `01`), hence `a - 1`
                     let idx = (a - 1) << 6 | (b - 1) << 4 | (c - 1) << 2 | (d - 1);
                     assert!(a + b + c + d <= 16);
-                    masks[idx] = (mask, (a + b + c + d) as u8);
+                    masks[idx] = (mask, a + b + c + d);
                     d += 1;
                 }
                 c += 1;
