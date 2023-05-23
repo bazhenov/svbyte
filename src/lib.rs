@@ -185,9 +185,12 @@ impl<'a> Segments for MemorySegments<'a> {
         Ok(segment.count)
     }
 
+    #[inline]
     fn data_stream(&self) -> &[u8] {
         self.data_stream
     }
+
+    #[inline]
     fn control_stream(&self) -> &[u8] {
         self.control_stream
     }
@@ -370,31 +373,6 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
         let mut buffer: *mut u32x4 = buffer.as_mut_ptr().cast();
         let mut control_words = control_stream.as_ptr();
 
-        // Decode loop unrolling
-        const UNROLL_FACTOR: usize = 8;
-        while iterations >= UNROLL_FACTOR {
-            for _ in 0..UNROLL_FACTOR {
-                let encoded_len = unsafe {
-                    debug_assert!(
-                        data_stream.wrapping_add(16) <= data_stream_end,
-                        "At least 16 bytes should be available in the data stream"
-                    );
-                    let data_stream = mem::transmute(data_stream);
-                    let output = mem::transmute(buffer);
-                    simd_decode(data_stream, *control_words, output)
-                };
-
-                control_words = control_words.wrapping_add(1);
-                buffer = buffer.wrapping_add(1);
-
-                data_stream = data_stream.wrapping_add(encoded_len as usize);
-                data_stream_offset += encoded_len as usize;
-            }
-
-            iterations -= UNROLL_FACTOR;
-        }
-
-        // Tail decode
         while iterations > 0 {
             let encoded_len = unsafe {
                 debug_assert!(
