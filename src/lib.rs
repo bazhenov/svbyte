@@ -65,7 +65,6 @@ use std::{
     arch::x86_64::{_mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128},
     debug_assert,
     io::{self, BufRead, Write},
-    mem,
 };
 
 #[allow(non_camel_case_types)]
@@ -373,22 +372,20 @@ impl<S: Segments> Decoder<u32> for DecodeCursor<S> {
         let mut buffer: *mut u32x4 = buffer.as_mut_ptr().cast();
         let mut control_words = control_stream.as_ptr();
 
+        // Tail decode
         while iterations > 0 {
-            let encoded_len = unsafe {
-                debug_assert!(
-                    data_stream.wrapping_add(16) <= data_stream_end,
-                    "At least 16 bytes should be available in the data stream"
-                );
-                let data_stream = mem::transmute(data_stream);
-                let output = mem::transmute(buffer);
-                simd_decode(data_stream, *control_words, output)
-            };
+            debug_assert!(
+                data_stream.wrapping_add(16) <= data_stream_end,
+                "At least 16 bytes should be available in the data stream"
+            );
+            let encoded_len =
+                unsafe { simd_decode(&*data_stream.cast(), *control_words, &mut *buffer) };
 
             control_words = control_words.wrapping_add(1);
             buffer = buffer.wrapping_add(1);
 
-            data_stream = data_stream.wrapping_add(encoded_len as usize);
-            data_stream_offset += encoded_len as usize;
+            data_stream = data_stream.wrapping_add(encoded_len);
+            data_stream_offset += encoded_len;
 
             iterations -= 1;
         }
